@@ -1,0 +1,52 @@
+use std::error::Error;
+use std::io::Write;
+
+use crc32c::crc32c;
+
+const FRAME_MAGIC_BYTE: &[u8; 1] = b"F";
+pub const FRAME_LEN: usize = 64 * 1024;
+pub const FRAME_HEADER_LEN: usize = 25;
+const FRAME_HASH_LEN: usize = 32;
+pub const FRAME_HASH_OFFSET: usize = FRAME_LEN - FRAME_HASH_LEN;
+pub const FRAME_DATA_SIZE: usize = FRAME_LEN - FRAME_HEADER_LEN - FRAME_HASH_LEN;
+
+pub fn open_frame(
+    mut frame: &mut [u8],
+    idx: u64,
+    seq: u64,
+    record_len: u64,
+) -> Result<(), Box<dyn Error>> {
+    frame.write_all(FRAME_MAGIC_BYTE)?;
+    frame.write_all(&idx.to_le_bytes())?;
+    frame.write_all(&seq.to_le_bytes())?;
+    frame.write_all(&record_len.to_le_bytes())?;
+
+    Ok(())
+}
+
+pub fn seal_frame(frame: &mut [u8]) {
+    let hash = crc32c(&frame[..FRAME_HASH_OFFSET]);
+
+    frame[FRAME_HASH_OFFSET..FRAME_HASH_OFFSET + 4].copy_from_slice(&hash.to_le_bytes());
+    frame[FRAME_HASH_OFFSET + 4..FRAME_LEN].fill(0u8);
+}
+
+pub fn verify_frame(frame: &[u8]) -> Result<(), Box<dyn Error>> {
+    if frame[0] != FRAME_MAGIC_BYTE[0] {
+        return Err("magic byte does not match".into());
+    }
+
+    let stored_hash = u32::from_le_bytes(
+        frame[FRAME_HASH_OFFSET..FRAME_HASH_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    );
+
+    let computed_hash = crc32c(&frame[..FRAME_HASH_OFFSET]);
+
+    if stored_hash != computed_hash {
+        return Err("hashes do not match".into());
+    }
+
+    Ok(())
+}
