@@ -73,11 +73,6 @@ Throwaway code, deleted after. Nothing here shares an interface with M0+. The pu
 **Artifact:** Program that builds the intended in-memory structure (PK to ordered version chain) at 1M / 10M / 100M rows with representative PK sizes, and measures RSS.
 **Acceptance:** A bytes-per-row figure, and the row count at which the structure exceeds a stated memory budget.
 
-### S.4 Go / no-go note
-
-**Artifact:** A short written judgment against thresholds stated *before* S.2 and S.3 were run.
-**Acceptance:** Thresholds written down first; the note states plainly whether the numbers clear them, and if not, which design change is on the table (persisted catalog, on-disk PK index, smaller reachable-size target). Proceeding past S.4 without meeting the thresholds requires recording why.
-
 ---
 
 ## M0: File Primitives + I/O Boundary

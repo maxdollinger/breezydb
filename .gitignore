@@ -3,4 +3,6 @@
 # Added by cargo
 
 /target
+
+# generated database files
 *.breezy

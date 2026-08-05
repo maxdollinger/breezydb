@@ -6,6 +6,7 @@ use crc32c::crc32c;
 const FRAME_MAGIC_BYTE: &[u8; 1] = b"F";
 pub const FRAME_LEN: usize = 64 * 1024;
 pub const FRAME_HEADER_LEN: usize = 25;
+const FRAME_REC_LEN_OFFSET: usize = 17;
 const FRAME_HASH_LEN: usize = 32;
 pub const FRAME_HASH_OFFSET: usize = FRAME_LEN - FRAME_HASH_LEN;
 pub const FRAME_DATA_SIZE: usize = FRAME_LEN - FRAME_HEADER_LEN - FRAME_HASH_LEN;
@@ -21,7 +22,15 @@ pub fn open_frame(
     frame.write_all(&seq.to_le_bytes())?;
     frame.write_all(&record_len.to_le_bytes())?;
 
+    frame.fill(0u8);
+
     Ok(())
+}
+
+pub fn get_frame_record_len(frame: &[u8]) -> Result<u64, Box<dyn Error>> {
+    Ok(u64::from_le_bytes(
+        frame[FRAME_REC_LEN_OFFSET..FRAME_REC_LEN_OFFSET + 8].try_into()?,
+    ))
 }
 
 pub fn seal_frame(frame: &mut [u8]) {

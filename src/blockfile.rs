@@ -9,15 +9,8 @@ pub fn write_frame(file: &File, idx: u64, data: &[u8; FRAME_LEN]) -> Result<()> 
     file.write_all_at(data, idx * FRAME_LEN as u64)
 }
 
-/// Makes the preceding write durable. Returns whether a syscall was actually issued, so the
-/// caller can count durability points without assuming what the mode does.
-pub fn sync_frame(file: &File) -> Result<bool> {
-    file.sync_all().map(|()| true)
-    //barrier_sync(file).map(|()| true)
-}
-
 #[cfg(target_vendor = "apple")]
-fn barrier_sync(file: &File) -> Result<()> {
+pub fn barrier_sync(file: &File) -> Result<()> {
     // Defined locally rather than taken from libc, which does not export it on every
     // apple target. Available since macOS 10.13.
     const F_BARRIERFSYNC: libc::c_int = 85;
@@ -30,17 +23,29 @@ fn barrier_sync(file: &File) -> Result<()> {
 }
 
 #[cfg(not(target_vendor = "apple"))]
-fn barrier_sync(file: &File) -> Result<()> {
+pub fn barrier_sync(file: &File) -> Result<()> {
     file.sync_data()
 }
 
-/// Reserves real blocks for the whole file up front.
-///
-/// `set_len` on its own is `ftruncate`, which leaves a sparse file: blocks are then allocated
-/// lazily inside every write, and each per-frame sync also has to flush the resulting
-/// extent-tree metadata. Preallocating moves that work out of the timed loop and is what
-/// docs/engine-design.md §2 requires ("the space must be really allocated or ENOSPC reappears
-/// at write time").
+/// Takes the page cache out of the read path so a scan measures the device, not RAM.
+#[cfg(target_vendor = "apple")]
+pub fn disable_page_cache(file: &File) -> Result<()> {
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+        return Err(Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn disable_page_cache(file: &File) -> Result<()> {
+    // Length 0 means "to end of file". posix_fadvise reports through its return value.
+    match unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) } {
+        0 => Ok(()),
+        err => Err(Error::from_raw_os_error(err)),
+    }
+}
+
 pub fn preallocate(file: &File, len: u64) -> Result<()> {
     reserve_blocks(file, len)?;
 
@@ -81,10 +86,4 @@ fn reserve_blocks(file: &File, len: u64) -> Result<()> {
         0 => Ok(()),
         err => Err(Error::from_raw_os_error(err)),
     }
-}
-
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-fn reserve_blocks(_file: &File, _len: u64) -> Result<()> {
-    // No portable way to reserve blocks; set_len alone still gives a correctly sized file.
-    Ok(())
 }

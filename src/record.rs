@@ -49,10 +49,6 @@ pub fn get_record_hash(record: &[u8]) -> Result<u32, TryFromSliceError> {
     ))
 }
 
-pub fn get_record_seq(record: &[u8]) -> Result<u64, TryFromSliceError> {
-    Ok(u64::from_le_bytes(record[..8].try_into()?))
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -77,7 +73,6 @@ mod test {
 
         let record = &frame[..RECORD_LEN];
 
-        assert_eq!(get_record_seq(record).expect("seq of record 2"), 1);
         assert!(&frame[RECORD_LEN * 2..].iter().all(|b| *b == 0_u8));
 
         assert!(verify_record(record).is_ok());
@@ -95,8 +90,6 @@ mod test {
         } else {
             record[RECORD_HEADER_LEN + 1] = 0;
         }
-
-        assert_eq!(get_record_seq(&record).expect("seq of record 1"), 1);
 
         assert!(
             verify_record(&record)

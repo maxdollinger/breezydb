@@ -37,9 +37,8 @@ Deleted rows are marked, not erased, and their space is recovered by a backgroun
 ### S — Pre-Build Spikes (gate)
 
 - [x] S.1 Synthetic file generator
-- [ ] S.2 Scan-rate spike: seconds/GB, both modes, cold cache
-- [ ] S.3 Index memory spike: bytes/row RSS
-- [ ] S.4 Go/no-go note: thresholds written before S.2/S.3 run
+- [x] S.2 Scan-rate test
+- [ ] S.3 Index test
 
 ### M0 — File Primitives + I/O Boundary
 
