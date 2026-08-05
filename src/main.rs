@@ -2,15 +2,24 @@ mod blockfile;
 mod frame;
 mod record;
 
-use std::{env::args, error::Error, fs::File, os::unix::fs::FileExt, time::Instant};
+use std::{
+    env::args,
+    error::Error,
+    fs::File,
+    os::unix::fs::FileExt,
+    thread::sleep,
+    time::{self, Instant},
+};
+
+use rand::{self, RngExt};
 
 use crate::{
-    blockfile::{barrier_sync, disable_page_cache, preallocate, write_frame},
+    blockfile::{barrier_sync, preallocate, write_frame},
     frame::{
-        FRAME_DATA_SIZE, FRAME_HEADER_LEN, FRAME_LEN, get_frame_record_len, open_frame, seal_frame,
-        verify_frame,
+        FRAME_DATA_SIZE, FRAME_HEADER_LEN, FRAME_LEN, get_frame_record_len, get_frame_seq,
+        get_min_max_wseq, open_frame, seal_frame, verify_frame,
     },
-    record::{RECORD_HASH_LEN, RECORD_HEADER_LEN, verify_record, write_record},
+    record::{RECORD_HASH_LEN, RECORD_HEADER_LEN, get_record_seq, verify_record, write_record},
 };
 
 const INVALID_SIZE_VALUE: &str = "size must be specified like [number][B | K | M | G]";
@@ -52,14 +61,16 @@ fn write_file(file: &File, frame_cnt: usize) -> std::io::Result<u64> {
     let record_cnt = FRAME_DATA_SIZE / record_len;
     let mut rec_seq: u64 = 1;
     let mut frame = [0u8; FRAME_LEN];
-    let mut rec_data = vec![0u8; 24];
+    let mut rec_data = [0u8; 24];
 
     for i in 0..frame_cnt {
         open_frame(frame.as_mut_slice(), i as u64, i as u64, record_len as u64).expect("new frame");
         let frame_data = &mut frame[FRAME_HEADER_LEN..];
 
+        let min_rseq = rec_seq;
         for c in 0..record_cnt {
-            rand::fill(rec_data.as_mut_slice());
+            rec_data[..8].copy_from_slice(rec_seq.to_le_bytes().as_slice());
+            rand::fill(&mut rec_data[8..]);
             let rec_start = c * record_len;
             let rec_end = rec_start + record_len;
             write_record(&mut frame_data[rec_start..rec_end], rec_seq, &rec_data)
@@ -67,7 +78,7 @@ fn write_file(file: &File, frame_cnt: usize) -> std::io::Result<u64> {
             rec_seq += 1;
         }
 
-        seal_frame(frame.as_mut_slice());
+        seal_frame(frame.as_mut_slice(), min_rseq, rec_seq - 1);
         write_frame(file, i as u64, &frame).expect("write frame to file");
 
         if i % 20 == 0 {
@@ -81,39 +92,70 @@ fn write_file(file: &File, frame_cnt: usize) -> std::io::Result<u64> {
     Ok(rec_seq - 1)
 }
 
-fn verify_file(file: &File) -> Result<(u64, u64), Box<dyn Error>> {
-    let size = file.metadata()?.len();
-    let frame_cnt = size / FRAME_LEN as u64;
+fn verify_file(file: &File) -> Result<Vec<(u32, u32)>, Box<dyn Error>> {
+    let size = file.metadata()?.len() as usize;
+    let frame_cnt = size / FRAME_LEN;
 
     let mut frame = [0u8; FRAME_LEN];
-    let mut frames_verified: u64 = 0;
-    let mut records_verified: u64 = 0;
+    let mut pk_idx: Vec<(u32, u32)> = Vec::with_capacity(frame_cnt);
 
     for i in 0..frame_cnt {
-        file.read_exact_at(frame.as_mut_slice(), i * FRAME_LEN as u64)?;
+        file.read_exact_at(frame.as_mut_slice(), (i * FRAME_LEN) as u64)?;
         verify_frame(frame.as_slice()).map_err(|e| format!("frame {i}: {e}"))?;
 
-        // let rec_len = get_frame_record_len(&frame)? as usize;
-        // if rec_len == 0 || rec_len > FRAME_DATA_SIZE {
-        //     return Err(format!("frame {i}: invalid record len {rec_len}").into());
-        // }
-        //
-        // let rec_cnt = FRAME_DATA_SIZE / rec_len;
-        // let frame_data = &frame[FRAME_HEADER_LEN..FRAME_HEADER_LEN + FRAME_DATA_SIZE];
-        //
-        // for r in 0..rec_cnt {
-        //     let start = r * rec_len;
-        //     let rec = &frame_data[start..start + rec_len];
-        //
-        //     verify_record(rec).map_err(|e| format!("frame {i}, record {r}: {e}"))?;
-        //
-        //     records_verified += 1;
-        // }
+        let rec_len = get_frame_record_len(&frame)? as usize;
+        if rec_len == 0 || rec_len > FRAME_DATA_SIZE {
+            return Err(format!("frame {i}: invalid record len {rec_len}").into());
+        }
 
-        frames_verified += 1;
+        let rec_cnt = FRAME_DATA_SIZE / rec_len;
+        let frame_data = &frame[FRAME_HEADER_LEN..FRAME_HEADER_LEN + FRAME_DATA_SIZE];
+
+        if i == 0 {
+            // Sized off the first frame so growing the index does not pollute the timing.
+            pk_idx.reserve(frame_cnt * rec_cnt);
+        }
+
+        for r in 0..rec_cnt {
+            let start = r * rec_len;
+            let rec = &frame_data[start..start + rec_len];
+
+            let pk = u64::from_le_bytes(rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + 8].try_into()?);
+
+            pk_idx.push((pk as u32, i as u32));
+        }
     }
 
-    Ok((frames_verified, records_verified))
+    pk_idx.sort_by_key(|a| a.0);
+
+    Ok(pk_idx)
+}
+
+fn find_record(file: &File, pk: u32, idx: u32) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut frame = [0u8; FRAME_LEN];
+    file.read_exact_at(frame.as_mut_slice(), (idx as usize * FRAME_LEN) as u64)?;
+
+    let rec_len = get_frame_record_len(&frame)? as usize;
+    if rec_len == 0 || rec_len > FRAME_DATA_SIZE {
+        return Err(format!("frame {idx}: invalid record len {rec_len}").into());
+    }
+
+    let rec_cnt = FRAME_DATA_SIZE / rec_len;
+    let frame_data = &frame[FRAME_HEADER_LEN..FRAME_HEADER_LEN + FRAME_DATA_SIZE];
+
+    for r in 0..rec_cnt {
+        let start = r * rec_len;
+        let rec = &frame_data[start..start + rec_len];
+
+        let stored_pk =
+            u64::from_le_bytes(rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + 8].try_into()?);
+
+        if stored_pk == pk as u64 {
+            return Ok(rec.to_vec());
+        }
+    }
+
+    Err("not found".into())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -170,16 +212,35 @@ fn main() -> Result<(), Box<dyn Error>> {
         let file = std::fs::OpenOptions::new().read(true).open(&file_name)?;
 
         let start_read = Instant::now();
-        let (frames_verified, records_verified) = verify_file(&file)?;
+        let pk_idx = verify_file(&file)?;
         let elapsed = start_read.elapsed();
+
+        let size = file.metadata()?.len() as usize;
+        let frame_cnt = size / FRAME_LEN;
         println!(
-            "verified {} frames, {} records in {:.3?} ({:.2} MiB/s)",
-            frames_verified,
-            records_verified,
+            "start scan took {:.3?} ({:.2} MiB/s)",
             elapsed,
-            (frames_verified * FRAME_LEN as u64) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
+            (frame_cnt * FRAME_LEN) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
         );
+
+        let start = Instant::now();
+        for _ in 0..100 {
+            let mut rng = rand::rng();
+            let pk = rng.random_range(0..pk_idx.len());
+            let idx = pk_idx
+                .binary_search_by_key(&pk, |&(pk, _)| pk as usize)
+                .expect("pk to exist");
+            let (_, frame_idx) = pk_idx[idx];
+
+            let record = find_record(&file, pk as u32, frame_idx)?;
+            // verify_record(record.as_slice())?;
+        }
+        let elapsed = start.elapsed();
+
+        println!("5 random lookups in avg {:.3?}", elapsed / 100);
     }
+
+    sleep(time::Duration::from_secs(10));
 
     Ok(())
 }

@@ -35,3 +35,25 @@ For a 10G file same throughput
 Reads with enabled os page cache do not need batching.
 A Frame hash is the complete frame (header + data).
 So only a more granular check should be done if the frame check failed.
+
+### S.3
+
+With ~167M records and building an index with (pk,frame_idx)
+the engine needs 2.5G memory.
+
+```
+start scan took 1.876s (5459.25 MiB/s)
+5 random lookups in 47.625µs
+```
+
+With ~84M records file sitting at a reasonable 1.2G Memory.
+Scales linear
+
+```
+start scan took 674.902ms (7586.19 MiB/s)
+5 random lookups in 47.375µs
+```
+
+HashMap cost's to much memory.
+With a view indices at 167M records only in memory indices are probably not a thing.
+But fine for now to start with.

@@ -1,26 +1,10 @@
 # breezyDB
 
-A database that gets out of your way.
+!! This is a personal research project.
 
-Talk to it over plain HTTP, no client library, no driver, no connection
-pool to configure. There's nothing to tune: no buffer sizes, no cache
-knobs, no vacuum schedules to babysit. Migrations, backups, and
-replication are built in, not bolted on.
-
-breezyDB will be good enough for almost every project, and you'll spend approximately zero time
-operating it.
-
-## Status
-
-This vision sits ahead of the current code.
-
-## Principles
-
-- **No driver.** Plain HTTP  JSON in, out.
-- **No knobs.** Sane defaults, not a settings page.
-- **Batteries included.** Migrations, backup, and replication ship with
-  the database, not as separate projects to wire up.
-- **Good enough, for most.
+- plain HTTP, no client library, no driver, no connection
+- nothing to tune: sensible defaults
+- batteries included: Migrations, backups, and replication built in
 
 ## Storage Engine
 
@@ -38,7 +22,7 @@ Deleted rows are marked, not erased, and their space is recovered by a backgroun
 
 - [x] S.1 Synthetic file generator
 - [x] S.2 Scan-rate test
-- [ ] S.3 Index test
+- [x] S.3 Index test
 
 ### M0 — File Primitives + I/O Boundary
 

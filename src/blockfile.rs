@@ -27,25 +27,6 @@ pub fn barrier_sync(file: &File) -> Result<()> {
     file.sync_data()
 }
 
-/// Takes the page cache out of the read path so a scan measures the device, not RAM.
-#[cfg(target_vendor = "apple")]
-pub fn disable_page_cache(file: &File) -> Result<()> {
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
-        return Err(Error::last_os_error());
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub fn disable_page_cache(file: &File) -> Result<()> {
-    // Length 0 means "to end of file". posix_fadvise reports through its return value.
-    match unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) } {
-        0 => Ok(()),
-        err => Err(Error::from_raw_os_error(err)),
-    }
-}
-
 pub fn preallocate(file: &File, len: u64) -> Result<()> {
     reserve_blocks(file, len)?;
 
