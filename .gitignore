@@ -6,3 +6,4 @@
 
 # generated database files
 *.breezy
+*.idx

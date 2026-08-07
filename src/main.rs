@@ -1,5 +1,7 @@
 mod blockfile;
+mod extsort;
 mod frame;
+mod pkindex;
 mod record;
 
 use std::{
@@ -7,6 +9,7 @@ use std::{
     error::Error,
     fs::File,
     os::unix::fs::FileExt,
+    path::{Path, PathBuf},
     thread::sleep,
     time::{self, Instant},
 };
@@ -15,10 +18,12 @@ use rand::{self, RngExt};
 
 use crate::{
     blockfile::{barrier_sync, preallocate, write_frame},
+    extsort::EntrySorter,
     frame::{
         FRAME_DATA_SIZE, FRAME_HEADER_LEN, FRAME_LEN, get_frame_record_len, get_frame_seq,
         get_min_max_wseq, open_frame, seal_frame, verify_frame,
     },
+    pkindex::PkIndex,
     record::{RECORD_HASH_LEN, RECORD_HEADER_LEN, get_record_seq, verify_record, write_record},
 };
 
@@ -26,20 +31,21 @@ const INVALID_SIZE_VALUE: &str = "size must be specified like [number][B | K | M
 
 const SUPER_BLOCK: usize = 128;
 
-fn get_size_arg() -> Option<String> {
+/// In-memory budget for the index build's sort stage. Everything beyond it spills.
+const DEFAULT_INDEX_MEM: usize = 64 * 1024 * 1024;
+
+const LOOKUPS: u32 = 200;
+
+fn get_arg(name: &str) -> Option<String> {
     let mut args = args();
 
-    args.position(|a| a == "--size")?;
+    args.position(|a| a == name)?;
 
     args.next()
 }
 
-fn get_verify_arg() -> Option<String> {
-    let mut args = args();
-
-    args.position(|a| a == "--verify")?;
-
-    args.next()
+fn has_flag(name: &str) -> bool {
+    args().any(|a| a == name)
 }
 
 fn parse_size_args(mut size: String) -> Result<usize, Box<dyn Error>> {
@@ -92,12 +98,30 @@ fn write_file(file: &File, frame_cnt: usize) -> std::io::Result<u64> {
     Ok(rec_seq - 1)
 }
 
-fn verify_file(file: &File) -> Result<Vec<(u32, u32)>, Box<dyn Error>> {
+struct ScanStats {
+    frames: usize,
+    sort_runs: usize,
+    scan: time::Duration,
+    build: time::Duration,
+}
+
+/// Scans every frame and writes the pk index to `index_path` as it goes. The index replaces
+/// the in-memory `Vec<(pk, frame_idx)>` this used to return: resident cost is now the sort
+/// budget rather than 8 bytes times the record count.
+fn verify_file(
+    file: &File,
+    index_path: &Path,
+    sort_budget: usize,
+    cache_pages: usize,
+) -> Result<(PkIndex, ScanStats), Box<dyn Error>> {
     let size = file.metadata()?.len() as usize;
     let frame_cnt = size / FRAME_LEN;
 
+    let spill_path = index_path.with_extension("sort");
+    let mut sorter = EntrySorter::new(sort_budget, &spill_path);
+
+    let scan_started = Instant::now();
     let mut frame = [0u8; FRAME_LEN];
-    let mut pk_idx: Vec<(u32, u32)> = Vec::with_capacity(frame_cnt);
 
     for i in 0..frame_cnt {
         file.read_exact_at(frame.as_mut_slice(), (i * FRAME_LEN) as u64)?;
@@ -111,27 +135,44 @@ fn verify_file(file: &File) -> Result<Vec<(u32, u32)>, Box<dyn Error>> {
         let rec_cnt = FRAME_DATA_SIZE / rec_len;
         let frame_data = &frame[FRAME_HEADER_LEN..FRAME_HEADER_LEN + FRAME_DATA_SIZE];
 
-        if i == 0 {
-            // Sized off the first frame so growing the index does not pollute the timing.
-            pk_idx.reserve(frame_cnt * rec_cnt);
-        }
-
         for r in 0..rec_cnt {
             let start = r * rec_len;
             let rec = &frame_data[start..start + rec_len];
 
             let pk = u64::from_le_bytes(rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + 8].try_into()?);
 
-            pk_idx.push((pk as u32, i as u32));
+            sorter.push(pk as u32, i as u32)?;
         }
     }
 
-    pk_idx.sort_by_key(|a| a.0);
+    let scan = scan_started.elapsed();
 
-    Ok(pk_idx)
+    let build_started = Instant::now();
+    let mut builder = pkindex::Builder::create(index_path, size as u64, frame_cnt as u32)?;
+    let sort_runs = sorter.drain(|pk, frame_idx| builder.push(pk, frame_idx))?;
+    let index = builder.finish(cache_pages)?;
+    let build = build_started.elapsed();
+
+    Ok((
+        index,
+        ScanStats {
+            frames: frame_cnt,
+            sort_runs,
+            scan,
+            build,
+        },
+    ))
 }
 
-fn find_record(file: &File, pk: u32, idx: u32) -> Result<Vec<u8>, Box<dyn Error>> {
+fn find_record(
+    file: &File,
+    index: &mut PkIndex,
+    pk: u32,
+) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    let Some(idx) = index.lookup(pk)? else {
+        return Ok(None);
+    };
+
     let mut frame = [0u8; FRAME_LEN];
     file.read_exact_at(frame.as_mut_slice(), (idx as usize * FRAME_LEN) as u64)?;
 
@@ -151,20 +192,21 @@ fn find_record(file: &File, pk: u32, idx: u32) -> Result<Vec<u8>, Box<dyn Error>
             u64::from_le_bytes(rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + 8].try_into()?);
 
         if stored_pk == pk as u64 {
-            return Ok(rec.to_vec());
+            return Ok(Some(rec.to_vec()));
         }
     }
 
-    Err("not found".into())
+    // The index pointed at this frame, so the record has to be in it.
+    Err(format!("pk {pk} not in frame {idx} the index points at").into())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let file_size_arg = match get_size_arg() {
+    let file_size_arg = match get_arg("--size") {
         Some(arg) => parse_size_args(arg)?,
         None => 0,
     };
 
-    let verify = match get_verify_arg() {
+    let verify = match get_arg("--verify") {
         Some(arg) => arg,
         None => "".to_string(),
     };
@@ -211,33 +253,123 @@ fn main() -> Result<(), Box<dyn Error>> {
     if is_verify {
         let file = std::fs::OpenOptions::new().read(true).open(&file_name)?;
 
-        let start_read = Instant::now();
-        let pk_idx = verify_file(&file)?;
-        let elapsed = start_read.elapsed();
+        let index_path = PathBuf::from(format!("{file_name}.idx"));
+        let sort_budget = match get_arg("--index-mem") {
+            Some(arg) => parse_size_args(arg)?,
+            None => DEFAULT_INDEX_MEM,
+        };
+        let cache_pages = match get_arg("--index-cache") {
+            Some(arg) => parse_size_args(arg)? / pkindex::PAGE_LEN,
+            None => pkindex::DEFAULT_CACHE_PAGES,
+        };
+        let mutations: u32 = match get_arg("--mutate") {
+            Some(arg) => arg.parse()?,
+            None => 0,
+        };
 
-        let size = file.metadata()?.len() as usize;
-        let frame_cnt = size / FRAME_LEN;
-        println!(
-            "start scan took {:.3?} ({:.2} MiB/s)",
-            elapsed,
-            (frame_cnt * FRAME_LEN) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
-        );
+        let size = file.metadata()?.len();
+        let frame_cnt = (size as usize / FRAME_LEN) as u32;
+
+        // A clean index over this exact file is still good, so the scan can be skipped
+        // entirely. Anything else — dirty, stale, missing — means rebuild.
+        let existing = match has_flag("--reuse-index") {
+            true => match PkIndex::open(&index_path, size, frame_cnt, cache_pages) {
+                Ok(index) => Some(index),
+                Err(e) => {
+                    println!("rebuilding index: {e}");
+                    None
+                }
+            },
+            false => None,
+        };
+
+        let started = Instant::now();
+        let mut index = match existing {
+            Some(index) => {
+                println!("reused index: {} records", index.entry_cnt());
+                index
+            }
+            None => {
+                let (index, stats) = verify_file(&file, &index_path, sort_budget, cache_pages)?;
+
+                let scanned = stats.frames * FRAME_LEN;
+                println!(
+                    "start scan took {:.3?} ({:.2} MiB/s): {} frames, {} records",
+                    stats.scan,
+                    scanned as f64 / (1024.0 * 1024.0) / stats.scan.as_secs_f64(),
+                    stats.frames,
+                    index.entry_cnt(),
+                );
+                println!(
+                    "index build took {:.3?} ({} sort runs, {} leaves, height {}, {:.2}MiB on disk)",
+                    stats.build,
+                    stats.sort_runs,
+                    index.leaf_cnt(),
+                    index.height(),
+                    index.size_on_disk() as f64 / (1024.0 * 1024.0),
+                );
+                index
+            }
+        };
+        println!("startup total {:.3?}", started.elapsed());
+
+        if index.entry_cnt() == 0 {
+            return Ok(());
+        }
+
+        let (min_key, max_key) = index.key_bounds();
+        let mut rng = rand::rng();
+        let mut hits = 0u32;
 
         let start = Instant::now();
-        for _ in 0..100 {
-            let mut rng = rand::rng();
-            let pk = rng.random_range(0..pk_idx.len());
-            let idx = pk_idx
-                .binary_search_by_key(&pk, |&(pk, _)| pk as usize)
-                .expect("pk to exist");
-            let (_, frame_idx) = pk_idx[idx];
+        for _ in 0..LOOKUPS {
+            let pk = rng.random_range(min_key..=max_key);
 
-            let record = find_record(&file, pk as u32, frame_idx)?;
-            // verify_record(record.as_slice())?;
+            if let Some(record) = find_record(&file, &mut index, pk)? {
+                // verify_record(record.as_slice())?;
+                hits += 1;
+                std::hint::black_box(&record);
+            }
         }
         let elapsed = start.elapsed();
 
-        println!("5 random lookups in avg {:.3?}", elapsed / 100);
+        println!(
+            "random lookups in avg {:.3?} ({hits}/{LOOKUPS} hit)",
+            elapsed / LOOKUPS
+        );
+
+        if mutations > 0 {
+            let pages_before = index.page_cnt();
+
+            // Repointing existing keys never splits; appending past max_key always lands in
+            // the rightmost leaf, which is the worst case for split churn.
+            let start = Instant::now();
+            for i in 0..mutations {
+                let pk = rng.random_range(min_key..=max_key);
+                index.upsert(pk, rng.random_range(0..frame_cnt))?;
+
+                if i % 4 == 0 {
+                    index.upsert(max_key + 1 + i / 4, frame_cnt - 1)?;
+                }
+            }
+            let elapsed = start.elapsed();
+            let ops = mutations + mutations.div_ceil(4);
+
+            println!(
+                "{ops} writes in {:.3?} ({:.0} writes/s, {} pages allocated, height {})",
+                elapsed,
+                ops as f64 / elapsed.as_secs_f64(),
+                index.page_cnt() - pages_before,
+                index.height(),
+            );
+
+            let start = Instant::now();
+            index.flush()?;
+            println!("index flush took {:.3?}", start.elapsed());
+        }
+
+        let (reads, writes) = index.cache_stats();
+        println!("index cache: {reads} page reads, {writes} page writes");
     }
 
     sleep(time::Duration::from_secs(10));
