@@ -22,6 +22,8 @@
 
 - DB index for _seq -> (file_id, offset): get's created on DB server start as linearHashMap
 
+## State
+
 ### Design validation
 
 - [ ] Synthetic file generator

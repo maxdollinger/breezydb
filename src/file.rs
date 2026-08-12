@@ -2,6 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::FileExt,
+    time::Instant,
 };
 
 #[derive(Debug)]
@@ -9,6 +10,7 @@ pub struct DbFile {
     pub seq: u16,
     file: File,
     pub written: usize,
+    pub max_size: u64,
     pub min_seq: u64,
     pub max_seq: u64,
     pub write_ops: u8,
@@ -16,10 +18,8 @@ pub struct DbFile {
 }
 
 impl DbFile {
-    pub const FILE_SIZE: usize = 1000 * 1024 * 1024;
-
-    pub fn new(file_seq: u16, rec_seq: u64) -> io::Result<Self> {
-        let name = format!("{file_seq}.breezy");
+    pub fn new(size: u64, file_seq: u16, rec_seq: u64) -> io::Result<Self> {
+        let name = format!("data/{file_seq}.breezy");
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -27,7 +27,7 @@ impl DbFile {
             .read(true)
             .open(&name)?;
 
-        file.set_len(DbFile::FILE_SIZE as u64)?;
+        file.set_len(size)?;
 
         file.write_all(&file_seq.to_le_bytes())?;
         file.sync_all()?;
@@ -36,6 +36,7 @@ impl DbFile {
             seq: file_seq,
             file,
             written: 2,
+            max_size: size,
             min_seq: rec_seq,
             max_seq: rec_seq,
             write_ops: 0,
@@ -72,6 +73,7 @@ impl DbFile {
             seq,
             file,
             written: size as usize,
+            max_size: size,
             min_seq,
             max_seq,
             write_ops: 0,
@@ -93,7 +95,8 @@ impl DbFile {
         self.max_seq = seq;
         self.write_ops += 1;
 
-        if self.write_ops >= 10 {
+        // Test speed up: consider feature like every n txn or if last txn was n time ago
+        if self.write_ops >= 100 {
             self.file.sync_all()?;
             self.write_ops = 0;
         }
@@ -102,7 +105,7 @@ impl DbFile {
     }
 
     pub fn has_space(&self, len: usize) -> bool {
-        self.written + len < DbFile::FILE_SIZE - 21
+        self.written + len < self.max_size as usize - 21
     }
 
     pub fn seal(&mut self) -> io::Result<()> {
