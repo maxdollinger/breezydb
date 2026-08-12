@@ -1,14 +1,13 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     os::unix::fs::FileExt,
-    time::Instant,
 };
 
 #[derive(Debug)]
 pub struct DbFile {
     pub seq: u16,
-    file: File,
+    pub file: File,
     pub written: usize,
     pub max_size: u64,
     pub min_seq: u64,
@@ -45,11 +44,11 @@ impl DbFile {
     }
 
     pub fn from_name(file_name: String) -> io::Result<Self> {
-        let mut file = OpenOptions::new().write(true).read(true).open(&file_name)?;
+        let file = OpenOptions::new().write(true).read(true).open(&file_name)?;
         let size = file.metadata()?.len();
 
         let mut b = [0u8; 2];
-        file.read_exact(b.as_mut_slice())?;
+        file.read_exact_at(b.as_mut_slice(), 0)?;
         let seq = u16::from_le_bytes(b);
 
         let mut footer = [0_u8; 21];

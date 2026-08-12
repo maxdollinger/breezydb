@@ -91,23 +91,40 @@ impl<'a> Record<'a> {
     }
 
     pub fn total_len(&self) -> usize {
-        RecordHeader::HEADER_SIZE + self.data.len() + Record::HASH_SIZE
+        RecordHeader::HEADER_SIZE + self.header.len as usize + Record::HASH_SIZE
     }
 
     pub fn from_slice(src: &'a [u8]) -> Result<Self, io::Error> {
-        let (header_slice, src) = src.split_at(RecordHeader::HEADER_SIZE);
-
-        let header = RecordHeader::from_slice(header_slice)?;
-
-        let needed_len = header.len as usize + Record::HASH_SIZE;
-        if src.len() < needed_len {
+        if src.len() < RecordHeader::HEADER_SIZE + Record::HASH_SIZE {
             return Err(io::ErrorKind::StorageFull.into());
         }
 
-        let (data, b) = src[..needed_len].split_last_chunk::<4>().unwrap();
+        let (header_slice, tail) = src.split_at(RecordHeader::HEADER_SIZE);
+
+        let header = RecordHeader::from_slice(header_slice)?;
+
+        if header.magic != Record::RECORD_MAGIC {
+            println!("magic number did not match");
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+
+        let needed_len = header.len as usize + Record::HASH_SIZE;
+        if tail.len() < needed_len {
+            return Err(io::ErrorKind::StorageFull.into());
+        }
+
+        let (data, b) = tail[..needed_len].split_last_chunk::<4>().unwrap();
         let hash = u32::from_le_bytes(*b);
 
-        Ok(Record { header, data, hash })
+        let rec = Record { header, data, hash };
+
+        let computed_hash = crc32c(&src[..rec.total_len() - Record::HASH_SIZE]);
+        if computed_hash != rec.hash {
+            println!("hashes did not match");
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+
+        Ok(rec)
     }
 
     pub fn write(&self, target: &mut [u8]) -> Result<usize, io::Error> {
