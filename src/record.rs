@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self};
 
 use crc32c::crc32c;
 
