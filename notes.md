@@ -1,0 +1,3 @@
+- The PK field of a schema is never allowed to change.
+- Schema needs and stable name.
+- Need to figure out how migrations work
