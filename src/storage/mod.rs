@@ -30,18 +30,28 @@
 //!   is why `close` exists.
 
 use std::io;
-use std::ops::Range;
 
 pub mod file;
 pub mod frame;
 mod writer;
 
+pub use file::{FileReader, FileStorage};
 pub use writer::{DEFAULT_READ_CONCURRENCY, Handle, ReadHandle, Writer, spawn};
 
-/// Whether a scan should keep going.
+/// What a scan should do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    Continue,
+    /// Keep going, reading from this **absolute** offset next.
+    ///
+    /// It has to be strictly past the offset the callback was handed, or the
+    /// same bytes come back forever. [`Reader::scan_all`] rejects anything else
+    /// rather than spinning on it.
+    Continue(u64),
+    /// Stop here.
+    ///
+    /// [`Reader::scan_all`] then reports the offset the final chunk started at,
+    /// since a callback that stops partway through one cannot say how far into
+    /// it it got.
     Stop,
 }
 
@@ -70,31 +80,59 @@ pub trait Storage: Send + 'static {
 
 /// The read side. Blocking, positional, and shared freely.
 pub trait Reader: Send + Sync + Clone + 'static {
-    /// Read at `offset` into `buf`, returning the byte count. A short read is
-    /// not an error; `0` means end of data.
+    /// Read at `offset` into `buf`, returning the byte count. `0` means end of
+    /// data.
+    ///
+    /// Implementations must fill `buf` unless the data ends first. `pread` is
+    /// allowed to come up short, so this is a real obligation, not a restatement:
+    /// the recovery scan decodes frames out of one chunk at a time, and a read
+    /// that stopped early mid-log would be indistinguishable from a torn tail and
+    /// would cut the log there.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
 
-    /// Returns the offset the scan stopped at.
-    fn scan_each<F>(&self, range: Range<u64>, buf: &mut [u8], mut f: F) -> io::Result<u64>
+    /// Read from byte zero in `buf`-sized chunks, handing each to `f`.
+    ///
+    /// `f` owns the cursor: it receives the absolute offset the chunk starts at
+    /// and says where to resume with [`Step::Continue`]. That is what lets a
+    /// callback parsing records leave a partial one at the end of a chunk and
+    /// pick it up whole on the next read, since chunk boundaries fall wherever
+    /// the buffer happens to end.
+    ///
+    /// Returns the offset the scan reached.
+    fn scan_all<F>(&self, buf: &mut [u8], mut f: F) -> io::Result<u64>
     where
         F: FnMut(u64, &[u8]) -> io::Result<Step>,
         Self: Sized,
     {
         if buf.is_empty() {
-            return Ok(0);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scan buffer must be non-empty",
+            ));
         }
 
-        let mut pos = range.start;
-        while pos < range.end {
-            let want = ((range.end - pos) as usize).min(buf.len());
-            let n = self.read_at(pos, &mut buf[..want])?;
+        let mut pos = 0;
+        loop {
+            let n = self.read_at(pos, buf)?;
             if n == 0 {
                 break;
             }
-            let step = f(pos, &buf[..n])?;
-            pos += n as u64;
-            if step == Step::Stop {
-                break;
+
+            match f(pos, &buf[..n])? {
+                Step::Stop => break,
+                Step::Continue(resume) => {
+                    // A resume point that does not advance would hand the
+                    // callback the same bytes forever. `read_at` only reports
+                    // `0` at EOF, so nothing else here would ever break the
+                    // loop.
+                    if resume <= pos {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("scan resumed at {resume}, which is not past {pos}"),
+                        ));
+                    }
+                    pos = resume;
+                }
             }
         }
 

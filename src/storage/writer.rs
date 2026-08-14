@@ -6,19 +6,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use crate::storage::frame::MAX_FRAME_LEN;
+use crate::storage::frame::FRAME_MAX_SIZE;
 
 use super::{Reader, Storage};
 
 /// Soft cap on a group commit. Once the scratch buffer reaches this, the loop
 /// stops absorbing and writes what it has.
-const MAX_BATCH: usize = 1 << 20;
+const MAX_BATCH: usize = 2 << 20;
 
 /// Blocking reads in flight, by default. Bounded because `spawn_blocking`'s own
 /// pool is far larger than what a disk can usefully service at once.
 pub const DEFAULT_READ_CONCURRENCY: usize = 32;
 
-/// Errors are fanned out to every waiter in a batch, so they are shared.
 type AckResult = Result<(), Arc<io::Error>>;
 
 enum Cmd {
@@ -33,7 +32,7 @@ enum Cmd {
 
 pub fn spawn<S: Storage>(store: S) -> (Writer, ReadHandle<S::Reader>, Handle<S>) {
     let start = store.len();
-    // This is the only place the watermark is created. Backends never see it.
+
     let len = Arc::new(AtomicU64::new(start));
 
     let reader = ReadHandle {
@@ -57,9 +56,11 @@ fn writer_loop<S: Storage>(
     visible: Arc<AtomicU64>,
 ) -> (S, Option<Arc<io::Error>>) {
     // Private to this loop. `visible` trails it, and only by a synced batch.
-    let mut scratch: Vec<u8> = Vec::with_capacity(MAX_BATCH + MAX_FRAME_LEN as usize);
+    let mut scratch: Vec<u8> = Vec::with_capacity(MAX_BATCH + FRAME_MAX_SIZE as usize);
     let mut waiters: Vec<oneshot::Sender<AckResult>> = Vec::new();
-    let mut sync = true;
+    // Set by a command that wants its batch closed now. Starts clear, or the
+    // absorb loop below is unreachable and every command commits alone.
+    let mut sync = false;
     let mut poison: Option<Arc<io::Error>> = None;
 
     while let Some(cmd) = rx.blocking_recv() {
@@ -99,17 +100,12 @@ fn writer_loop<S: Storage>(
         }
 
         scratch.clear();
-        sync = true;
+        sync = false;
     }
 
     (s, poison)
 }
 
-/// Append, sync, publish — in that order, and nothing is published unless both
-/// of the first two succeeded.
-///
-/// `?` rather than `and`: the batch has already been handed to the disk by the
-/// time the next step runs, so every step has to be able to not happen.
 fn commit<S: Storage>(s: &mut S, batch: &[u8], visible: &AtomicU64) -> io::Result<()> {
     let written = s.append(batch)?;
     visible.fetch_add(written, Ordering::Release);
@@ -139,10 +135,6 @@ fn absorb(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Writer
-// ---------------------------------------------------------------------------
-
 /// Cloned per task. Every clone feeds the same writer thread.
 #[derive(Clone)]
 pub struct Writer {
@@ -150,11 +142,7 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Append a record and wait until it is durable.
-    ///
-    /// When this returns `Ok`, the record is on disk *and* visible to readers —
-    /// acked and readable mean the same thing on this path.
-    pub async fn append(&self, data: Vec<u8>) -> io::Result<()> {
+    pub async fn append_sync(&self, data: Vec<u8>) -> io::Result<()> {
         self.dispatch(|ack| Cmd::Append {
             data,
             sync: true,
@@ -163,14 +151,7 @@ impl Writer {
         .await
     }
 
-    /// Append without forcing a sync.
-    ///
-    /// Returning `Ok` here means the bytes reached the file, not that they
-    /// survived a crash — and because the watermark only advances on sync, they
-    /// are **not readable** until some later batch syncs. Pair it with
-    /// [`Writer::sync`], or use [`Writer::append`] unless the write is
-    /// genuinely disposable.
-    pub async fn append_sync(&self, data: Vec<u8>) -> io::Result<()> {
+    pub async fn append(&self, data: Vec<u8>) -> io::Result<()> {
         self.dispatch(|ack| Cmd::Append {
             data,
             sync: false,
@@ -179,7 +160,6 @@ impl Writer {
         .await
     }
 
-    /// Make every preceding append durable and visible.
     pub async fn sync(&self) -> io::Result<()> {
         self.dispatch(|ack| Cmd::Sync { ack }).await
     }
@@ -198,12 +178,7 @@ impl Writer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ReadHandle
-// ---------------------------------------------------------------------------
-
 /// Cloned per request. Cloning is two refcount bumps.
-///
 /// Every read is clamped to the visibility watermark, so a reader can never
 /// observe bytes that a crash would take back.
 #[derive(Clone)]
@@ -214,8 +189,6 @@ pub struct ReadHandle<R> {
 }
 
 impl<R: Reader> ReadHandle<R> {
-    /// Durable, readable byte count. Validate client-supplied offsets against
-    /// this.
     pub fn len(&self) -> u64 {
         self.len.load(Ordering::Acquire)
     }
@@ -224,8 +197,6 @@ impl<R: Reader> ReadHandle<R> {
         self.len() == 0
     }
 
-    /// Positional read, clamped to the watermark. `0` means nothing visible at
-    /// `offset`.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let end = self.len();
         if offset >= end {
@@ -267,10 +238,6 @@ impl<R: Reader> ReadHandle<R> {
         .map_err(|e| io::Error::other(format!("blocking read task failed: {e}")))?
     }
 }
-
-// ---------------------------------------------------------------------------
-// Handle
-// ---------------------------------------------------------------------------
 
 /// Owns the writer thread. Never cloned.
 pub struct Handle<S> {
