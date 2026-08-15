@@ -1,8 +1,10 @@
 //! The writer thread and the three handles that talk to it.
 
+use core::time;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::sleep;
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
@@ -12,7 +14,7 @@ use super::{Reader, Storage};
 
 /// Soft cap on a group commit. Once the scratch buffer reaches this, the loop
 /// stops absorbing and writes what it has.
-const MAX_BATCH: usize = 4 << 20;
+const MAX_BATCH: usize = 8 << 20;
 
 /// Blocking reads in flight, by default. Bounded because `spawn_blocking`'s own
 /// pool is far larger than what a disk can usefully service at once.
@@ -67,10 +69,14 @@ fn writer_loop<S: Storage>(
     while let Some(cmd) = rx.blocking_recv() {
         absorb(cmd, &mut scratch, &mut waiters);
 
-        while let Ok(cmd) = rx.try_recv()
-            && scratch.len() < MAX_BATCH
-        {
-            absorb(cmd, &mut scratch, &mut waiters);
+        sleep(time::Duration::from_millis(2));
+        while scratch.len() < MAX_BATCH {
+            match rx.try_recv() {
+                Ok(cmd) => {
+                    absorb(cmd, &mut scratch, &mut waiters);
+                }
+                Err(_) => break,
+            }
         }
 
         let res: AckResult = match poison.clone() {
@@ -141,7 +147,7 @@ impl Writer {
         let _permit = Arc::clone(&self.buffered_size)
             .acquire_many_owned(data.len() as u32)
             .await
-            .map_err(|_| stopped())?;
+            .map_err(|_| io::Error::other("could not aquire quota semaphore"))?;
 
         self.dispatch(|ack| Cmd::Append { data, ack }).await
     }
@@ -155,11 +161,17 @@ impl Writer {
         make: impl FnOnce(oneshot::Sender<AckResult>) -> Cmd + Send,
     ) -> io::Result<()> {
         let (ack, done) = oneshot::channel();
-        self.tx.send(make(ack)).await.map_err(|_| stopped())?;
+        self.tx
+            .send(make(ack))
+            .await
+            .map_err(|_| io::Error::other("failed channel send"))?;
         match done.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(clone_err(&e)),
-            Err(_) => Err(stopped()),
+            Err(e) => {
+                println!("{e}");
+                Err(io::Error::other("failed channel await"))
+            }
         }
     }
 }
@@ -254,10 +266,6 @@ impl<S: Send + 'static> Handle<S> {
             Err(_) => Err(io::Error::other("storage writer thread panicked")),
         }
     }
-}
-
-fn stopped() -> io::Error {
-    io::Error::other("storage writer stopped")
 }
 
 /// `io::Error` is not `Clone`, and the batch fan-out needs one error per
