@@ -12,7 +12,7 @@ use super::{Reader, Storage};
 
 /// Soft cap on a group commit. Once the scratch buffer reaches this, the loop
 /// stops absorbing and writes what it has.
-const MAX_BATCH: usize = 2 << 20;
+const MAX_BATCH: usize = 4 << 20;
 
 /// Blocking reads in flight, by default. Bounded because `spawn_blocking`'s own
 /// pool is far larger than what a disk can usefully service at once.
@@ -23,7 +23,6 @@ type AckResult = Result<(), Arc<io::Error>>;
 enum Cmd {
     Append {
         data: Vec<u8>,
-        sync: bool,
         ack: oneshot::Sender<AckResult>,
     },
     /// Contributes no bytes; just forces the batch it lands in to sync.
@@ -41,44 +40,42 @@ pub fn spawn<S: Storage>(store: S) -> (Writer, ReadHandle<S::Reader>, Handle<S>)
         reads: Arc::new(Semaphore::new(DEFAULT_READ_CONCURRENCY)),
     };
 
-    let (tx, rx) = mpsc::channel(128);
+    let (tx, rx) = mpsc::channel(4096);
     let join = std::thread::Builder::new()
         .name("storage-writer".into())
         .spawn(move || writer_loop(store, rx, len))
         .expect("spawn writer thread");
 
-    (Writer { tx }, reader, Handle { join })
+    let writer = Writer {
+        tx,
+        buffered_size: Arc::new(Semaphore::new(DEFAULT_QUEUED_BYTES)),
+    };
+
+    (writer, reader, Handle { join })
 }
 
 fn writer_loop<S: Storage>(
     mut s: S,
     mut rx: mpsc::Receiver<Cmd>,
-    visible: Arc<AtomicU64>,
+    durable_bytes: Arc<AtomicU64>,
 ) -> (S, Option<Arc<io::Error>>) {
     // Private to this loop. `visible` trails it, and only by a synced batch.
-    let mut scratch: Vec<u8> = Vec::with_capacity(MAX_BATCH + FRAME_MAX_SIZE as usize);
+    let mut scratch: Vec<u8> = Vec::with_capacity(FRAME_MAX_SIZE as usize);
     let mut waiters: Vec<oneshot::Sender<AckResult>> = Vec::new();
-    // Set by a command that wants its batch closed now. Starts clear, or the
-    // absorb loop below is unreachable and every command commits alone.
-    let mut sync = false;
     let mut poison: Option<Arc<io::Error>> = None;
 
     while let Some(cmd) = rx.blocking_recv() {
-        absorb(cmd, &mut scratch, &mut waiters, &mut sync);
+        absorb(cmd, &mut scratch, &mut waiters);
 
-        // Do not commit directly keep on buffering commits
-        if !sync {
-            while let Ok(cmd) = rx.try_recv() {
-                absorb(cmd, &mut scratch, &mut waiters, &mut sync);
-                if scratch.len() >= MAX_BATCH || sync {
-                    break;
-                }
-            }
+        while let Ok(cmd) = rx.try_recv()
+            && scratch.len() < MAX_BATCH
+        {
+            absorb(cmd, &mut scratch, &mut waiters);
         }
 
         let res: AckResult = match poison.clone() {
             Some(e) => Err(e),
-            None => commit(&mut s, &scratch, &visible).map_err(|e| {
+            None => commit(&mut s, &scratch, &durable_bytes).map_err(|e| {
                 let e = Arc::new(e);
                 poison = Some(Arc::clone(&e));
                 e
@@ -90,7 +87,7 @@ fn writer_loop<S: Storage>(
         }
 
         if let Some(cause) = poison.clone() {
-            let offset = visible.load(Ordering::Relaxed);
+            let offset = durable_bytes.load(Ordering::Relaxed);
             poison = match s.truncate(offset) {
                 Ok(()) => None,
                 Err(e) => Some(Arc::new(io::Error::other(format!(
@@ -100,7 +97,6 @@ fn writer_loop<S: Storage>(
         }
 
         scratch.clear();
-        sync = false;
     }
 
     (s, poison)
@@ -112,52 +108,42 @@ fn commit<S: Storage>(s: &mut S, batch: &[u8], visible: &AtomicU64) -> io::Resul
     Ok(())
 }
 
-fn absorb(
-    cmd: Cmd,
-    scratch: &mut Vec<u8>,
-    waiters: &mut Vec<oneshot::Sender<AckResult>>,
-    sync: &mut bool,
-) {
+fn absorb(cmd: Cmd, scratch: &mut Vec<u8>, waiters: &mut Vec<oneshot::Sender<AckResult>>) {
     match cmd {
-        Cmd::Append {
-            mut data,
-            sync: d,
-            ack,
-        } => {
+        Cmd::Append { mut data, ack } => {
             scratch.append(&mut data);
-            *sync |= d;
             waiters.push(ack);
         }
         Cmd::Sync { ack } => {
-            *sync = true;
             waiters.push(ack);
         }
     }
 }
+
+pub const DEFAULT_QUEUED_BYTES: usize = 32 << 20;
 
 /// Cloned per task. Every clone feeds the same writer thread.
 #[derive(Clone)]
 pub struct Writer {
     tx: mpsc::Sender<Cmd>,
+    buffered_size: Arc<Semaphore>,
 }
 
 impl Writer {
-    pub async fn append_sync(&self, data: Vec<u8>) -> io::Result<()> {
-        self.dispatch(|ack| Cmd::Append {
-            data,
-            sync: true,
-            ack,
-        })
-        .await
-    }
-
     pub async fn append(&self, data: Vec<u8>) -> io::Result<()> {
-        self.dispatch(|ack| Cmd::Append {
-            data,
-            sync: false,
-            ack,
-        })
-        .await
+        if data.len() > FRAME_MAX_SIZE as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame to big".to_string(),
+            ));
+        }
+
+        let _permit = Arc::clone(&self.buffered_size)
+            .acquire_many_owned(data.len() as u32)
+            .await
+            .map_err(|_| stopped())?;
+
+        self.dispatch(|ack| Cmd::Append { data, ack }).await
     }
 
     pub async fn sync(&self) -> io::Result<()> {
