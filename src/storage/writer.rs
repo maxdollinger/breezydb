@@ -1,10 +1,8 @@
 //! The writer thread and the three handles that talk to it.
 
-use core::time;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::sleep;
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
@@ -69,12 +67,9 @@ fn writer_loop<S: Storage>(
     while let Some(cmd) = rx.blocking_recv() {
         absorb(cmd, &mut scratch, &mut waiters);
 
-        sleep(time::Duration::from_millis(2));
         while scratch.len() < MAX_BATCH {
             match rx.try_recv() {
-                Ok(cmd) => {
-                    absorb(cmd, &mut scratch, &mut waiters);
-                }
+                Ok(cmd) => absorb(cmd, &mut scratch, &mut waiters),
                 Err(_) => break,
             }
         }
