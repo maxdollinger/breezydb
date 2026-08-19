@@ -15,7 +15,8 @@ use super::{Reader, Storage};
 pub struct FileStorage {
     file: Arc<File>,
     path: PathBuf,
-    len: u64,
+    pos: u64,
+    durable: u64,
 }
 
 impl FileStorage {
@@ -41,7 +42,8 @@ impl FileStorage {
         Ok(Self {
             file,
             path,
-            len: file_len,
+            pos: file_len,
+            durable: file_len,
         })
     }
 
@@ -55,39 +57,52 @@ impl Storage for FileStorage {
 
     fn append(&mut self, data: &[u8]) -> io::Result<u64> {
         if data.is_empty() {
+            return Ok(0);
+        }
+
+        self.file.write_all_at(data, self.pos)?;
+
+        self.pos += data.len() as u64;
+        Ok(data.len() as u64)
+    }
+
+    fn append_sync(&mut self, data: &[u8]) -> io::Result<u64> {
+        if data.is_empty() {
             self.file.sync_data()?;
             return Ok(0);
         }
 
-        self.file.write_all_at(data, self.len)?;
-        self.file.sync_data()?;
+        self.file.write_all_at(data, self.pos)?;
+        self.pos += data.len() as u64;
 
-        self.len += data.len() as u64;
+        self.file.sync_data()?;
+        self.durable = self.pos;
         Ok(data.len() as u64)
     }
 
-    fn len(&self) -> u64 {
-        self.len
+    fn durable_pos(&self) -> u64 {
+        self.durable
     }
 
-    fn is_empty(&self) -> bool {
-        self.len == 0
+    fn pos(&self) -> u64 {
+        self.pos
     }
 
     fn truncate(&mut self, offset: u64) -> io::Result<()> {
-        if offset > self.len {
+        if offset > self.pos {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "cannot truncate to {offset}, past the durable length {}",
-                    self.len
+                    self.pos
                 ),
             ));
         }
 
         self.file.set_len(offset)?;
+        self.pos = offset;
         self.file.sync_all()?;
-        self.len = offset;
+        self.durable = self.pos;
         Ok(())
     }
 

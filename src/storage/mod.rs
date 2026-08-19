@@ -32,11 +32,10 @@
 use std::io;
 
 pub mod file;
-pub mod frame;
-mod writer;
+pub mod storage;
 
 pub use file::{FileReader, FileStorage};
-pub use writer::{DEFAULT_READ_CONCURRENCY, Handle, ReadHandle, Writer, spawn};
+pub use storage::{DEFAULT_READ_CONCURRENCY, Handle, Writer, spawn};
 
 /// What a scan should do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,10 +65,11 @@ pub trait Storage: Send + 'static {
     // apends are always durable
     fn append(&mut self, data: &[u8]) -> io::Result<u64>;
 
-    /// Durable byte count.
-    fn len(&self) -> u64;
+    fn append_sync(&mut self, data: &[u8]) -> io::Result<u64>;
 
-    fn is_empty(&self) -> bool;
+    fn durable_pos(&self) -> u64;
+
+    fn pos(&self) -> u64;
 
     fn truncate(&mut self, offset: u64) -> io::Result<()>;
 

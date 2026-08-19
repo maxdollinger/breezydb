@@ -2,7 +2,7 @@ use std::io::{self};
 
 use crc32c::crc32c;
 
-use crate::{Reader, Step};
+use crate::{Reader, Step, data::schema::parse_u32};
 
 // IDEA: A Frame is = to one transaction. The payload could be 1:n records but has a max size of 8Mb
 
@@ -10,8 +10,7 @@ pub const FRAME_MAGIC: u32 = u32::from_le_bytes(*b"brzy");
 /// `[u32 magic][u32 len][u64 seq]`.
 pub const HEADER_LEN: usize = 16;
 pub const HASH_SIZE: usize = 4;
-pub const FRAME_MAX_SIZE: u32 = 8 << 20;
-
+pub const FRAME_MAX_SIZE: u32 = 4 << 20;
 pub const MIN_FRAME_LEN: usize = HEADER_LEN + HASH_SIZE;
 
 pub fn frame_len(payload_len: usize) -> u32 {
@@ -45,7 +44,7 @@ pub fn frame_encode_into(target: &mut [u8], seq: u64, payload: &[u8]) -> io::Res
     let seal_offset = HEADER_LEN + payload.len();
     target[HEADER_LEN..seal_offset].copy_from_slice(payload);
 
-    let hash = crc32c(&target[4..seal_offset]);
+    let hash = crc32c(&target[..seal_offset]);
     target[seal_offset..seal_offset + HASH_SIZE].copy_from_slice(&hash.to_le_bytes());
 
     Ok(frame_len as usize)
@@ -59,7 +58,10 @@ pub fn frame_decode_into<'a>(raw: &'a [u8], frame: &mut Frame<'a>) -> io::Result
         ));
     }
 
-    let magic = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+    let mut pos: usize = 0;
+
+    let mut magic = 0_u32;
+    pos += parse_u32(&raw[pos..], &mut magic)?;
     if magic != FRAME_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -67,13 +69,14 @@ pub fn frame_decode_into<'a>(raw: &'a [u8], frame: &mut Frame<'a>) -> io::Result
         ));
     }
 
-    let total = u32::from_le_bytes(raw[4..8].try_into().unwrap());
-    if (total as usize) < MIN_FRAME_LEN || total > FRAME_MAX_SIZE {
+    pos += parse_u32(&raw[pos..], &mut frame.len)?;
+    if (frame.len as usize) < MIN_FRAME_LEN || frame.len > FRAME_MAX_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame length {total} out of range"),
+            format!("frame length {frame.len} out of range"),
         ));
     }
+
     let total = total as usize;
     if raw.len() < total {
         return Err(io::Error::new(
@@ -81,8 +84,6 @@ pub fn frame_decode_into<'a>(raw: &'a [u8], frame: &mut Frame<'a>) -> io::Result
             "frame length overruns the buffer",
         ));
     }
-
-    frame.len = total as u32;
 
     frame.seq = u64::from_le_bytes(raw[8..16].try_into().unwrap());
 

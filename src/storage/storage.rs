@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use crate::storage::frame::FRAME_MAX_SIZE;
+use crate::data::frame::FRAME_MAX_SIZE;
 
 use super::{Reader, Storage};
 
@@ -17,6 +17,7 @@ const MAX_BATCH: usize = 8 << 20;
 /// Blocking reads in flight, by default. Bounded because `spawn_blocking`'s own
 /// pool is far larger than what a disk can usefully service at once.
 pub const DEFAULT_READ_CONCURRENCY: usize = 32;
+pub const WRITE_QUEUE_DEPTH: usize = 4096;
 
 type AckResult = Result<(), Arc<io::Error>>;
 
@@ -30,7 +31,7 @@ enum Cmd {
 }
 
 pub fn spawn<S: Storage>(store: S) -> (Writer, ReadHandle<S::Reader>, Handle<S>) {
-    let start = store.len();
+    let start = store.pos();
 
     let len = Arc::new(AtomicU64::new(start));
 
@@ -40,7 +41,7 @@ pub fn spawn<S: Storage>(store: S) -> (Writer, ReadHandle<S::Reader>, Handle<S>)
         reads: Arc::new(Semaphore::new(DEFAULT_READ_CONCURRENCY)),
     };
 
-    let (tx, rx) = mpsc::channel(4096);
+    let (tx, rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
     let join = std::thread::Builder::new()
         .name("storage-writer".into())
         .spawn(move || writer_loop(store, rx, len))
@@ -76,11 +77,15 @@ fn writer_loop<S: Storage>(
 
         let res: AckResult = match poison.clone() {
             Some(e) => Err(e),
-            None => commit(&mut s, &scratch, &durable_bytes).map_err(|e| {
-                let e = Arc::new(e);
-                poison = Some(Arc::clone(&e));
-                e
-            }),
+            None => s
+                .append_sync(scratch.as_slice())
+                .map(|w| durable_bytes.fetch_add(w, Ordering::Release))
+                .map(|_| ())
+                .map_err(|e| {
+                    let e = Arc::new(e);
+                    poison = Some(Arc::clone(&e));
+                    e
+                }),
         };
 
         for w in waiters.drain(..) {
@@ -101,12 +106,6 @@ fn writer_loop<S: Storage>(
     }
 
     (s, poison)
-}
-
-fn commit<S: Storage>(s: &mut S, batch: &[u8], visible: &AtomicU64) -> io::Result<()> {
-    let written = s.append(batch)?;
-    visible.fetch_add(written, Ordering::Release);
-    Ok(())
 }
 
 fn absorb(cmd: Cmd, scratch: &mut Vec<u8>, waiters: &mut Vec<oneshot::Sender<AckResult>>) {

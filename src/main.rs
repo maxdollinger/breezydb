@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use axum::{
     Router, extract::RawQuery, extract::State, http::StatusCode, routing::get, serve::ListenerExt,
 };
-use breezydb::storage::frame::FRAME_MAX_SIZE;
+use breezydb::data::frame::FRAME_MAX_SIZE;
 use breezydb::{FileStorage, Writer, spawn};
 
 /// Smallest payload the load generators produce. Matches `/frame`.
@@ -86,7 +86,7 @@ impl Metrics {
         let count = self.count.swap(0, Ordering::Relaxed);
         let nanos = self.nanos.swap(0, Ordering::Relaxed);
         let max = self.max_nanos.swap(0, Ordering::Relaxed);
-        let mean = if count == 0 { 0 } else { nanos / count };
+        let mean = nanos.checked_div(count).unwrap_or(0);
         (count, Duration::from_nanos(mean), Duration::from_nanos(max))
     }
 }
@@ -173,9 +173,12 @@ async fn bench_handler(
 ) -> Result<String, (StatusCode, String)> {
     let p = BenchParams::parse(q.as_deref());
 
-    let _guard = Arc::clone(&s.bench)
-        .try_lock_owned()
-        .map_err(|_| (StatusCode::CONFLICT, "a bench run is already in progress\n".into()))?;
+    let _guard = Arc::clone(&s.bench).try_lock_owned().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "a bench run is already in progress\n".into(),
+        )
+    })?;
 
     let dur = Duration::from_secs(p.secs);
     let started = Instant::now();
@@ -292,9 +295,12 @@ async fn bench_handler(
 
     let mut all = Run::default();
     for t in tasks {
-        let r = t
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("bench task: {e}\n")))?;
+        let r = t.await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("bench task: {e}\n"),
+            )
+        })?;
         all.samples.extend_from_slice(&r.samples);
         all.scouts.extend_from_slice(&r.scouts);
         all.bytes += r.bytes;
@@ -392,7 +398,7 @@ impl BenchParams {
             }
         }
 
-        p.tasks = p.tasks.clamp(1, 4096);
+        p.tasks = p.tasks.clamp(1, 10000);
         p.secs = p.secs.clamp(1, 60);
         p.max_size = p.max_size.clamp(MIN_PAYLOAD + 1, FRAME_MAX_SIZE as usize);
         p.burst = p.burst.clamp(1, 1024);
@@ -413,11 +419,12 @@ fn render(p: &BenchParams, elapsed: Duration, r: &Run) -> String {
     let lat = &r.samples;
     let secs = elapsed.as_secs_f64();
     let count = lat.len() as u64;
-    let mean = if count == 0 {
-        Duration::ZERO
-    } else {
-        Duration::from_nanos(lat.iter().sum::<u64>() / count)
-    };
+    let mean = lat
+        .iter()
+        .sum::<u64>()
+        .checked_div(count)
+        .map(Duration::from_nanos)
+        .unwrap_or(Duration::ZERO);
 
     let load = if p.rate == 0 {
         "closed loop (saturating)".to_string()
