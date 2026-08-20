@@ -85,6 +85,7 @@ pub trait Reader: Send + Sync + Clone + 'static {
     ///
     /// Implementations must fill `buf` unless the data ends first. `pread` is
     /// allowed to come up short, so this is a real obligation, not a restatement:
+    ///
     /// the recovery scan decodes frames out of one chunk at a time, and a read
     /// that stopped early mid-log would be indistinguishable from a torn tail and
     /// would cut the log there.

@@ -6,13 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use crate::data::frame::FRAME_MAX_SIZE;
+use crate::data::transaction::Transaction;
 
 use super::{Reader, Storage};
-
-/// Soft cap on a group commit. Once the scratch buffer reaches this, the loop
-/// stops absorbing and writes what it has.
-const MAX_BATCH: usize = 8 << 20;
 
 /// Blocking reads in flight, by default. Bounded because `spawn_blocking`'s own
 /// pool is far larger than what a disk can usefully service at once.
@@ -24,16 +20,29 @@ type AckResult = Result<(), Arc<io::Error>>;
 enum Cmd {
     Append {
         data: Vec<u8>,
+        seq: (u64, u64),
         ack: oneshot::Sender<AckResult>,
     },
-    /// Contributes no bytes; just forces the batch it lands in to sync.
-    Sync { ack: oneshot::Sender<AckResult> },
 }
 
-pub fn spawn<S: Storage>(store: S) -> (Writer, ReadHandle<S::Reader>, Handle<S>) {
+#[derive(Clone, Debug)]
+pub struct SequenceClock {
+    seq: Arc<AtomicU64>,
+}
+
+impl SequenceClock {
+    pub fn get_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+pub fn spawn<S: Storage>(store: S) -> (SequenceClock, Writer, ReadHandle<S::Reader>, Handle<S>) {
     let start = store.pos();
 
     let len = Arc::new(AtomicU64::new(start));
+    let seq = SequenceClock {
+        seq: Arc::new(AtomicU64::new(1)),
+    };
 
     let reader = ReadHandle {
         inner: store.reader(),
@@ -52,7 +61,7 @@ pub fn spawn<S: Storage>(store: S) -> (Writer, ReadHandle<S::Reader>, Handle<S>)
         buffered_size: Arc::new(Semaphore::new(DEFAULT_QUEUED_BYTES)),
     };
 
-    (writer, reader, Handle { join })
+    (seq, writer, reader, Handle { join })
 }
 
 fn writer_loop<S: Storage>(
@@ -61,24 +70,25 @@ fn writer_loop<S: Storage>(
     durable_bytes: Arc<AtomicU64>,
 ) -> (S, Option<Arc<io::Error>>) {
     // Private to this loop. `visible` trails it, and only by a synced batch.
-    let mut scratch: Vec<u8> = Vec::with_capacity(FRAME_MAX_SIZE as usize);
-    let mut waiters: Vec<oneshot::Sender<AckResult>> = Vec::new();
+    let mut txn = Transaction::new();
+    let mut waiters: Vec<oneshot::Sender<AckResult>> = Vec::with_capacity(WRITE_QUEUE_DEPTH);
     let mut poison: Option<Arc<io::Error>> = None;
 
     while let Some(cmd) = rx.blocking_recv() {
-        absorb(cmd, &mut scratch, &mut waiters);
+        txn.open();
+        absorb(cmd, &mut txn, &mut waiters);
 
-        while scratch.len() < MAX_BATCH {
+        while txn.size().0 < (4 << 20) {
             match rx.try_recv() {
-                Ok(cmd) => absorb(cmd, &mut scratch, &mut waiters),
+                Ok(cmd) => absorb(cmd, &mut txn, &mut waiters),
                 Err(_) => break,
-            }
+            };
         }
 
         let res: AckResult = match poison.clone() {
             Some(e) => Err(e),
             None => s
-                .append_sync(scratch.as_slice())
+                .append_sync(txn.commit())
                 .map(|w| durable_bytes.fetch_add(w, Ordering::Release))
                 .map(|_| ())
                 .map_err(|e| {
@@ -101,23 +111,18 @@ fn writer_loop<S: Storage>(
                 )))),
             };
         }
-
-        scratch.clear();
     }
 
     (s, poison)
 }
 
-fn absorb(cmd: Cmd, scratch: &mut Vec<u8>, waiters: &mut Vec<oneshot::Sender<AckResult>>) {
+fn absorb(cmd: Cmd, txn: &mut Transaction, waiters: &mut Vec<oneshot::Sender<AckResult>>) {
     match cmd {
-        Cmd::Append { mut data, ack } => {
-            scratch.append(&mut data);
+        Cmd::Append { data, ack, seq } => {
+            txn.add(seq, &data);
             waiters.push(ack);
         }
-        Cmd::Sync { ack } => {
-            waiters.push(ack);
-        }
-    }
+    };
 }
 
 pub const DEFAULT_QUEUED_BYTES: usize = 32 << 20;
@@ -130,8 +135,8 @@ pub struct Writer {
 }
 
 impl Writer {
-    pub async fn append(&self, data: Vec<u8>) -> io::Result<()> {
-        if data.len() > FRAME_MAX_SIZE as usize {
+    pub async fn append(&self, seq: (u64, u64), data: Vec<u8>) -> io::Result<()> {
+        if data.len() > Transaction::MAX_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "frame to big".to_string(),
@@ -143,11 +148,7 @@ impl Writer {
             .await
             .map_err(|_| io::Error::other("could not aquire quota semaphore"))?;
 
-        self.dispatch(|ack| Cmd::Append { data, ack }).await
-    }
-
-    pub async fn sync(&self) -> io::Result<()> {
-        self.dispatch(|ack| Cmd::Sync { ack }).await
+        self.dispatch(|ack| Cmd::Append { seq, data, ack }).await
     }
 
     async fn dispatch(

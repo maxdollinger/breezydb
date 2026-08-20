@@ -68,6 +68,7 @@ dependencies = [
  "crc32c",
  "libc",
  "rand",
+ "serde_json",
  "tokio",
 ]
 
