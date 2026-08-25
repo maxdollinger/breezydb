@@ -26,12 +26,12 @@ impl Transaction {
     pub const HEADER_LEN: usize = 20;
     pub const HASH_SIZE: usize = 4;
     pub const MIN_SIZE: usize = Transaction::HEADER_LEN + Transaction::HASH_SIZE;
-    pub const MAX_SIZE: usize = Record::MAX_SIZE + Transaction::MIN_SIZE;
+    pub const MAX_SIZE: usize = (16 << 20) + Transaction::MIN_SIZE;
 
     pub fn new() -> Self {
         Transaction {
             len: 0,
-            buf: vec![0u8; 2 * Transaction::MAX_SIZE],
+            buf: vec![0u8; Transaction::MAX_SIZE + Record::MAX_SIZE],
         }
     }
 
@@ -62,11 +62,13 @@ impl Transaction {
         let hash = crc32c(&self.buf[..self.len]);
         self.len += u32_write_at(self.buf.as_mut_slice(), self.len, hash);
 
+        println!("Finished txn with len of {}kB", self.len / 1024);
+
         &self.buf[..self.len]
     }
 
-    pub fn size(&self) -> (usize, usize) {
-        (self.len, self.buf.len())
+    pub fn has_capacity(&self) -> bool {
+        (self.len + Transaction::HASH_SIZE) < Transaction::MAX_SIZE
     }
 
     fn get_max_seq(&self) -> u64 {

@@ -34,6 +34,11 @@ impl SequenceClock {
     pub fn get_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
+
+    pub fn reserv_n(&self, n: u64) -> (u64, u64) {
+        let start = self.seq.fetch_add(n, Ordering::Relaxed);
+        (start, start + n - 1)
+    }
 }
 
 pub fn spawn<S: Storage>(store: S) -> (SequenceClock, Writer, ReadHandle<S::Reader>, Handle<S>) {
@@ -56,10 +61,7 @@ pub fn spawn<S: Storage>(store: S) -> (SequenceClock, Writer, ReadHandle<S::Read
         .spawn(move || writer_loop(store, rx, len))
         .expect("spawn writer thread");
 
-    let writer = Writer {
-        tx,
-        buffered_size: Arc::new(Semaphore::new(DEFAULT_QUEUED_BYTES)),
-    };
+    let writer = Writer { tx };
 
     (seq, writer, reader, Handle { join })
 }
@@ -78,7 +80,7 @@ fn writer_loop<S: Storage>(
         txn.open();
         absorb(cmd, &mut txn, &mut waiters);
 
-        while txn.size().0 < (4 << 20) {
+        while txn.has_capacity() {
             match rx.try_recv() {
                 Ok(cmd) => absorb(cmd, &mut txn, &mut waiters),
                 Err(_) => break,
@@ -131,7 +133,6 @@ pub const DEFAULT_QUEUED_BYTES: usize = 32 << 20;
 #[derive(Clone)]
 pub struct Writer {
     tx: mpsc::Sender<Cmd>,
-    buffered_size: Arc<Semaphore>,
 }
 
 impl Writer {
@@ -142,11 +143,6 @@ impl Writer {
                 "frame to big".to_string(),
             ));
         }
-
-        let _permit = Arc::clone(&self.buffered_size)
-            .acquire_many_owned(data.len() as u32)
-            .await
-            .map_err(|_| io::Error::other("could not aquire quota semaphore"))?;
 
         self.dispatch(|ack| Cmd::Append { seq, data, ack }).await
     }

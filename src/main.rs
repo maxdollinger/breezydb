@@ -1,10 +1,8 @@
 use std::io;
 use std::net::SocketAddr;
-use std::time::Instant;
 
 use axum::{Router, extract::State, http::StatusCode, routing::get, serve::ListenerExt};
 use breezydb::data::record::Record;
-use breezydb::data::transaction::Transaction;
 use breezydb::storage::storage::SequenceClock;
 use breezydb::{FileStorage, Writer, spawn};
 
@@ -47,23 +45,18 @@ struct AppState {
 async fn frame_handler(
     State(s): State<AppState>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let rec_cnt: usize = rand::random_range(1..20);
-
-    let seq: Vec<u64> = (0..=rec_cnt).into_iter().map(|_| s.seq.get_seq()).collect();
+    let (min_seq, max_seq) = s.seq.reserv_n(8000);
 
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut len: usize = 0;
-    for i in seq.iter() {
-        let rec = Record::new(*i, 1, b"Hello from test endpoint.")
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    for seq in min_seq..=max_seq {
+        let rec =
+            Record::new(seq, 1, b"Hello").map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         buf.resize(len + rec.size(), 0u8);
         len += rec
             .encode(&mut buf[len..])
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     }
-
-    let min_seq = *seq.first().unwrap();
-    let max_seq = *seq.last().unwrap();
 
     s.w.append((min_seq, max_seq), buf)
         .await
@@ -71,7 +64,7 @@ async fn frame_handler(
 
     Ok((
         StatusCode::CREATED,
-        format!("wrote {} bytes with ({min_seq},{max_seq})", len),
+        format!("wrote {} bytes, from {} to {}", len, min_seq, max_seq),
     ))
 }
 
