@@ -1,98 +1,131 @@
-//! The writer thread and the three handles that talk to it.
+//! The libsql writer thread and the two handles that talk to it.
+//!
+//! Writes are serialized onto one dedicated OS thread that owns a single
+//! libsql [`Connection`]. That thread is independent of the async worker pool,
+//! so a saturated HTTP server cannot starve it.
+//!
+//! Group commit: the thread drains whatever is queued into one `IMMEDIATE`
+//! transaction and commits it once, so N appends cost one WAL fsync.
 
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use libsql::{Builder, Connection, Statement, TransactionBehavior, params};
+use tokio::runtime::Handle as RtHandle;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::data::transaction::Transaction;
-
-use super::{Reader, Storage};
-
-/// Blocking reads in flight, by default. Bounded because `spawn_blocking`'s own
-/// pool is far larger than what a disk can usefully service at once.
-pub const DEFAULT_READ_CONCURRENCY: usize = 32;
+/// How many queued appends the writer holds before producers block.
 pub const WRITE_QUEUE_DEPTH: usize = 4096;
+
+/// Cap on bytes absorbed into a single group commit.
+pub const MAX_BATCH_BYTES: usize = 16 << 20;
+
+/// The single append-only table every write lands in.
+pub const CREATE_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS data (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema INTEGER NOT NULL,
+    data   BLOB    NOT NULL
+);";
+
+/// The one insert the writer ever runs. Prepared once, reused for every row.
+pub const INSERT_SQL: &str = "INSERT INTO data (schema, data) VALUES (?1, ?2)";
+
+/// One row to append. Each row carries its own schema.
+pub struct Append {
+    pub schema: i64,
+    pub data: Vec<u8>,
+}
 
 type AckResult = Result<(), Arc<io::Error>>;
 
 enum Cmd {
-    Append {
-        data: Vec<u8>,
-        seq: (u64, u64),
+    AppendMany {
+        rows: Vec<Append>,
         ack: oneshot::Sender<AckResult>,
     },
 }
 
-#[derive(Clone, Debug)]
-pub struct SequenceClock {
-    seq: Arc<AtomicU64>,
-}
-
-impl SequenceClock {
-    pub fn get_seq(&self) -> u64 {
-        self.seq.fetch_add(1, Ordering::Relaxed)
+impl Cmd {
+    fn bytes(&self) -> usize {
+        match self {
+            Cmd::AppendMany { rows, .. } => rows.iter().map(|r| r.data.len()).sum(),
+        }
     }
 
-    pub fn reserv_n(&self, n: u64) -> (u64, u64) {
-        let start = self.seq.fetch_add(n, Ordering::Relaxed);
-        (start, start + n - 1)
+    fn rows(&self) -> &[Append] {
+        match self {
+            Cmd::AppendMany { rows, .. } => rows,
+        }
+    }
+
+    fn ack(self) -> oneshot::Sender<AckResult> {
+        match self {
+            Cmd::AppendMany { ack, .. } => ack,
+        }
     }
 }
 
-pub fn spawn<S: Storage>(store: S) -> (SequenceClock, Writer, ReadHandle<S::Reader>, Handle<S>) {
-    let start = store.pos();
+/// Open the database, apply the tuning pragmas, create the table, and start the
+/// writer thread.
+///
+/// The pragmas run on the connection that becomes the writer, before it is
+/// handed to the thread. `page_size` only takes effect on a fresh database
+/// file; an existing file keeps its old page size unless vacuumed.
+pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
+    let db = Builder::new_local(path).build().await.map_err(to_io)?;
+    let conn = db.connect().map_err(to_io)?;
 
-    let len = Arc::new(AtomicU64::new(start));
-    let seq = SequenceClock {
-        seq: Arc::new(AtomicU64::new(1)),
-    };
+    conn.execute_batch(
+        "PRAGMA page_size = 65536;
+         PRAGMA journal_mode = WAL;",
+    )
+    .await
+    .map_err(to_io)?;
+    conn.execute_batch(CREATE_TABLE).await.map_err(to_io)?;
 
-    let reader = ReadHandle {
-        inner: store.reader(),
-        len: Arc::clone(&len),
-        reads: Arc::new(Semaphore::new(DEFAULT_READ_CONCURRENCY)),
-    };
+    let insert = conn.prepare(INSERT_SQL).await.map_err(to_io)?;
 
+    let rt = RtHandle::current();
     let (tx, rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
     let join = std::thread::Builder::new()
         .name("storage-writer".into())
-        .spawn(move || writer_loop(store, rx, len))
+        .spawn(move || {
+            let _db = db;
+            writer_loop(conn, insert, rt, rx)
+        })
         .expect("spawn writer thread");
 
-    let writer = Writer { tx };
-
-    (seq, writer, reader, Handle { join })
+    Ok((Writer { tx }, Handle { join }))
 }
 
-fn writer_loop<S: Storage>(
-    mut s: S,
+fn writer_loop(
+    conn: Connection,
+    insert: Statement,
+    rt: RtHandle,
     mut rx: mpsc::Receiver<Cmd>,
-    durable_bytes: Arc<AtomicU64>,
-) -> (S, Option<Arc<io::Error>>) {
-    // Private to this loop. `visible` trails it, and only by a synced batch.
-    let mut txn = Transaction::new();
-    let mut waiters: Vec<oneshot::Sender<AckResult>> = Vec::with_capacity(WRITE_QUEUE_DEPTH);
+) -> Option<Arc<io::Error>> {
     let mut poison: Option<Arc<io::Error>> = None;
 
     while let Some(cmd) = rx.blocking_recv() {
-        txn.open();
-        absorb(cmd, &mut txn, &mut waiters);
+        let mut batch = vec![cmd];
+        let mut bytes = batch[0].bytes();
 
-        while txn.has_capacity() {
+        while bytes < MAX_BATCH_BYTES {
             match rx.try_recv() {
-                Ok(cmd) => absorb(cmd, &mut txn, &mut waiters),
+                Ok(cmd) => {
+                    bytes += cmd.bytes();
+                    batch.push(cmd);
+                }
                 Err(_) => break,
-            };
+            }
         }
 
         let res: AckResult = match poison.clone() {
             Some(e) => Err(e),
-            None => s
-                .append_sync(txn.commit())
-                .map(|w| durable_bytes.fetch_add(w, Ordering::Release))
-                .map(|_| ())
+            None => rt
+                .block_on(commit_batch(&conn, &insert, &batch))
                 .map_err(|e| {
                     let e = Arc::new(e);
                     poison = Some(Arc::clone(&e));
@@ -100,34 +133,37 @@ fn writer_loop<S: Storage>(
                 }),
         };
 
-        for w in waiters.drain(..) {
-            let _ = w.send(res.clone());
-        }
-
-        if let Some(cause) = poison.clone() {
-            let offset = durable_bytes.load(Ordering::Relaxed);
-            poison = match s.truncate(offset) {
-                Ok(()) => None,
-                Err(e) => Some(Arc::new(io::Error::other(format!(
-                    "{cause}; repair failed: {e}"
-                )))),
-            };
+        for cmd in batch {
+            let _ = cmd.ack().send(res.clone());
         }
     }
 
-    (s, poison)
+    poison
 }
 
-fn absorb(cmd: Cmd, txn: &mut Transaction, waiters: &mut Vec<oneshot::Sender<AckResult>>) {
-    match cmd {
-        Cmd::Append { data, ack, seq } => {
-            txn.add(seq, &data);
-            waiters.push(ack);
+/// One group commit: every queued append in a single `IMMEDIATE` transaction.
+async fn commit_batch(
+    conn: &Connection,
+    insert: &Statement,
+    batch: &[Cmd],
+) -> io::Result<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .map_err(to_io)?;
+
+    for cmd in batch {
+        for row in cmd.rows() {
+            insert.reset();
+            insert
+                .execute(params![row.schema, row.data.as_slice()])
+                .await
+                .map_err(to_io)?;
         }
-    };
-}
+    }
 
-pub const DEFAULT_QUEUED_BYTES: usize = 32 << 20;
+    tx.commit().await.map_err(to_io)
+}
 
 /// Cloned per task. Every clone feeds the same writer thread.
 #[derive(Clone)]
@@ -136,131 +172,47 @@ pub struct Writer {
 }
 
 impl Writer {
-    pub async fn append(&self, seq: (u64, u64), data: Vec<u8>) -> io::Result<()> {
-        if data.len() > Transaction::MAX_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "frame to big".to_string(),
-            ));
-        }
-
-        self.dispatch(|ack| Cmd::Append { seq, data, ack }).await
-    }
-
-    async fn dispatch(
-        &self,
-        make: impl FnOnce(oneshot::Sender<AckResult>) -> Cmd + Send,
-    ) -> io::Result<()> {
+    pub async fn append_many(&self, rows: Vec<Append>) -> io::Result<()> {
         let (ack, done) = oneshot::channel();
         self.tx
-            .send(make(ack))
+            .send(Cmd::AppendMany { rows, ack })
             .await
             .map_err(|_| io::Error::other("failed channel send"))?;
         match done.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(clone_err(&e)),
-            Err(e) => {
-                println!("{e}");
-                Err(io::Error::other("failed channel await"))
-            }
+            Err(_) => Err(io::Error::other("failed channel await")),
         }
-    }
-}
-
-/// Cloned per request. Cloning is two refcount bumps.
-/// Every read is clamped to the visibility watermark, so a reader can never
-/// observe bytes that a crash would take back.
-#[derive(Clone)]
-pub struct ReadHandle<R> {
-    inner: R,
-    len: Arc<AtomicU64>,
-    reads: Arc<Semaphore>,
-}
-
-impl<R: Reader> ReadHandle<R> {
-    pub fn len(&self) -> u64 {
-        self.len.load(Ordering::Acquire)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let end = self.len();
-        if offset >= end {
-            return Ok(0);
-        }
-        let want = ((end - offset) as usize).min(buf.len());
-        if want == 0 {
-            return Ok(0);
-        }
-        self.inner.read_at(offset, &mut buf[..want])
-    }
-
-    /// [`read_at`](Self::read_at) from async code, returning what was visible.
-    pub async fn read(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        self.blocking(move |r| {
-            let mut buf = vec![0u8; len];
-            let n = r.read_at(offset, &mut buf)?;
-            buf.truncate(n);
-            Ok(buf)
-        })
-        .await
-    }
-
-    async fn blocking<T, F>(&self, f: F) -> io::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&Self) -> io::Result<T> + Send + 'static,
-    {
-        let permit = Arc::clone(&self.reads)
-            .acquire_owned()
-            .await
-            .map_err(|_| io::Error::other("read semaphore closed"))?;
-        let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            f(&this)
-        })
-        .await
-        .map_err(|e| io::Error::other(format!("blocking read task failed: {e}")))?
     }
 }
 
 /// Owns the writer thread. Never cloned.
-pub struct Handle<S> {
-    join: std::thread::JoinHandle<(S, Option<Arc<io::Error>>)>,
+pub struct Handle {
+    join: std::thread::JoinHandle<Option<Arc<io::Error>>>,
 }
 
-impl<S: Send + 'static> Handle<S> {
+impl Handle {
     /// Wait for the writer thread to finish and surface its last error.
     ///
     /// Drop every [`Writer`] clone first, or this waits forever: the loop exits
     /// when the command channel closes. `Drop` cannot report an error, which is
     /// why this exists.
-    pub async fn close(self) -> io::Result<S> {
+    pub async fn close(self) -> io::Result<()> {
         tokio::task::spawn_blocking(move || match self.join.join() {
-            Ok((store, None)) => Ok(store),
-            Ok((_, Some(e))) => Err(clone_err(&e)),
+            Ok(None) => Ok(()),
+            Ok(Some(e)) => Err(clone_err(&e)),
             Err(_) => Err(io::Error::other("storage writer thread panicked")),
         })
         .await
         .map_err(|e| io::Error::other(format!("join task failed: {e}")))?
     }
-
-    /// Blocking [`close`](Self::close), for shutdown paths with no runtime.
-    pub fn close_blocking(self) -> io::Result<S> {
-        match self.join.join() {
-            Ok((store, None)) => Ok(store),
-            Ok((_, Some(e))) => Err(clone_err(&e)),
-            Err(_) => Err(io::Error::other("storage writer thread panicked")),
-        }
-    }
 }
 
-/// `io::Error` is not `Clone`, and the batch fan-out needs one error per
-/// waiter.
+fn to_io(e: libsql::Error) -> io::Error {
+    io::Error::other(e.to_string())
+}
+
+/// `io::Error` is not `Clone`, and the batch fan-out needs one error per waiter.
 fn clone_err(e: &io::Error) -> io::Error {
     match e.raw_os_error() {
         Some(code) => io::Error::from_raw_os_error(code),
