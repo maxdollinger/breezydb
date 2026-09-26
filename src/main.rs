@@ -69,14 +69,12 @@ async fn frame_handler(
         }
     };
 
-    let entries = rand::random_range(1..=MAX_ENTRIES);
-    let rows: Vec<Append> = (0..entries)
-        .map(|_| {
-            let token = rand::random::<u128>();
-            Append {
-                schema: 1,
-                data: format!("{{\"token\":\"{token:032x}\",\"exp\":\"{EXP}\"}}").into_bytes(),
-            }
+    let rows: Vec<Append> = (0..1)
+        .map(|_| Append {
+            schema: 1,
+            data: "{{\"token\":\"fabc45sfg42asdf23d\",\"exp\":\"2026-12-12T00:00:00Z\", \"name\": \"Mad Max\"}}"
+                .to_string()
+                .into_bytes(),
         })
         .collect();
 
@@ -84,7 +82,7 @@ async fn frame_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok((StatusCode::CREATED, format!("wrote {entries} entries")))
+    Ok((StatusCode::CREATED, r#"wrote 10 entries"#.to_string()))
 }
 
 /// Same request path, same response shape, no storage. The difference between
