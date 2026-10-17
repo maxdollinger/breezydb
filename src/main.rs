@@ -2,22 +2,33 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{Router, extract::State, http::StatusCode, routing::get, serve::ListenerExt};
-use breezydb::{Append, Writer, spawn};
+use axum::body::Bytes;
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    serve::ListenerExt,
+};
+use breezydb::{FrameOp, Writer, spawn};
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
-/// Fixed expiry stamped on every generated entry.
-const EXP: &str = "2026-12-12T00:00:00Z";
+/// Rough per-op memory budget for the inflight guard.
+const OP_BYTES: u32 = 96;
 
-/// `/frame` writes between 1 and `MAX_ENTRIES` entries.
-const MAX_ENTRIES: usize = 10;
-
-/// Rough per-entry memory budget for the inflight guard.
-const ENTRY_BYTES: u32 = 96;
+/// Ops assumed inflight per request when reserving memory.
+const MAX_OPS: usize = 10;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let (w, h) = spawn("data/test.db").await?;
+    let db_path = std::env::var("DB").unwrap_or_else(|_| "data/test.db".to_string());
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+
+    let (w, h) = spawn(&db_path).await?;
 
     let state = AppState {
         w,
@@ -25,11 +36,11 @@ async fn main() -> io::Result<()> {
     };
 
     let app = Router::new()
-        .route("/frame", get(frame_handler))
+        .route("/tx", post(tx_handler))
         .route("/noop", get(noop_handler))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("listening on {addr}");
 
     // Responses here are a few dozen bytes. Without this, Nagle holds them back
@@ -53,41 +64,65 @@ struct AppState {
     inflight: Arc<Semaphore>,
 }
 
-async fn frame_handler(
-    State(s): State<AppState>,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let _permit = match s
-        .inflight
-        .try_acquire_many_owned(ENTRY_BYTES * MAX_ENTRIES as u32)
-    {
+/// One request === one frame === one transaction. The body is either a bare
+/// array of ops or `{ "ops": [...] }`; see [`FrameOp`] for the op shapes.
+async fn tx_handler(State(s): State<AppState>, body: Bytes) -> (StatusCode, Json<Value>) {
+    let _permit = match s.inflight.try_acquire_many_owned(OP_BYTES * MAX_OPS as u32) {
         Ok(permit) => permit,
         Err(_) => {
-            return Err((
+            return (
                 StatusCode::INSUFFICIENT_STORAGE,
-                "To many requests inflight, no memory left".to_string(),
-            ));
+                Json(json!({ "success": false, "error": "too many requests inflight, no memory left" })),
+            );
         }
     };
 
-    let rows: Vec<Append> = (0..1)
-        .map(|_| Append {
-            schema: 1,
-            data: "{{\"token\":\"fabc45sfg42asdf23d\",\"exp\":\"2026-12-12T00:00:00Z\", \"name\": \"Mad Max\"}}"
-                .to_string()
-                .into_bytes(),
-        })
-        .collect();
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return bad_request("invalid JSON body"),
+    };
 
-    s.w.append_many(rows)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let ops_value = if parsed.is_array() {
+        parsed
+    } else {
+        match parsed.get("ops") {
+            Some(v) if v.is_array() => v.clone(),
+            _ => return bad_request("expected an array of ops, or { ops: [...] }"),
+        }
+    };
 
-    Ok((StatusCode::CREATED, r#"wrote 10 entries"#.to_string()))
+    let ops: Vec<FrameOp> = match serde_json::from_value(ops_value) {
+        Ok(ops) => ops,
+        Err(e) => return bad_request(format!("invalid ops: {e}")),
+    };
+
+    match s.w.write_frame(ops).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "tx": result.tx,
+                "results": result.results,
+                "bindings": result.bindings,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "success": false, "error": e.to_string() })),
+        ),
+    }
 }
 
 /// Same request path, same response shape, no storage. The difference between
-/// this route's client-side average and `/frame`'s is what durability costs;
-/// this route's own client-side average is everything else.
+/// this route's client-side average and `/tx`'s is what durability costs; this
+/// route's own client-side average is everything else.
 async fn noop_handler(State(_): State<AppState>) -> (StatusCode, String) {
     (StatusCode::CREATED, "OK".to_string())
+}
+
+fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "success": false, "error": msg.into() })),
+    )
 }
