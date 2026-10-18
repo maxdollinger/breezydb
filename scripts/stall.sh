@@ -18,7 +18,7 @@ set -u
 RATE=${1:-4000}
 DUR=${2:-4m}
 OUT=${3:-/tmp/breezy-stall}
-CONN=${4:-128}
+CONN=${4:-1024}
 BODY=/tmp/breezy-knee-body.jsonl
 DB="$OUT/db.sqlite"
 PROBE_TX='{"ops":[{"op":"entity","as":"$e"},{"op":"add","e":"$e","a":2,"v":"probe"}]}'

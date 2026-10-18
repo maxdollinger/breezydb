@@ -7,8 +7,9 @@
 //! cargo run --release --example seed_node -- /tmp/breezy-load.db [N]
 //! ```
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use rusqlite::Connection;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "data/test.db".to_string());
@@ -17,18 +18,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
-    let db = turso::Builder::new_local(&path).build().await?;
-    let conn = db.connect()?;
+    let conn = Connection::open(&path)?;
 
     // `page_size` only takes effect before the file has any pages, so the seeder
     // must set it too — otherwise the server's pragma lands on a non-empty file
     // and is ignored, and every "page size" experiment silently runs at 4096.
     let page_size = std::env::var("BREEZY_PAGE_SIZE").unwrap_or_else(|_| "4096".to_string());
-    conn.pragma_update("page_size", page_size.as_str()).await?;
+    conn.execute_batch(&format!("PRAGMA page_size={page_size};"))?;
 
     // Honor the index experiment so the server and the seed agree on the schema.
     let schema = breezydb::storage::schema_for_env();
-    conn.execute_batch(&schema).await?;
+    conn.execute_batch(&schema)?;
 
     // Attribute ids are `2..=n+1` so the generator can address `node/{i}` as id
     // `i+1`. All are cardinality-one strings; each request creates a fresh
@@ -46,8 +46,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             i,
         ));
     }
-    conn.execute_batch(&sql).await?;
+    conn.execute_batch(&sql)?;
 
-    println!("seeded {path}: concept node + {n} attributes (node/1..node/{n}, ids 2..{})", n + 1);
+    println!(
+        "seeded {path}: concept node + {n} attributes (node/1..node/{n}, ids 2..{})",
+        n + 1
+    );
     Ok(())
 }

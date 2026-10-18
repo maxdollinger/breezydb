@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 
 [ "$#" -ge 1 ] || { echo "usage: scripts/knee.sh <qps> [<qps> ...]" >&2; exit 1; }
 DUR="${DUR:-10s}"
-CONN="${CONN:-128}"
+CONN="${CONN:-1024}"
 PORT="${PORT:-3000}"
 N_ATTRS="${N_ATTRS:-20}"
 DB="${DB:-/tmp/breezy-knee.db}"

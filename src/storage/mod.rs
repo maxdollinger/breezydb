@@ -1,9 +1,9 @@
-//! TursoDB-backed EAV storage: one writer thread, group commits.
+//! SQLite-backed EAV storage: one writer thread, group commits.
 //!
-//! Writes are serialized onto a single dedicated OS thread that owns a Turso
-//! connection. It is independent of the async worker pool, so a busy HTTP
-//! server cannot starve it. [`Writer`] clones feed that thread; [`Handle`] owns
-//! it and surfaces the last error on shutdown.
+//! Writes are serialized onto a single dedicated OS thread that owns a SQLite
+//! connection (real SQLite, bundled via rusqlite). It is independent of the
+//! async worker pool, so a busy HTTP server cannot starve it. [`Writer`] clones
+//! feed that thread; [`Handle`] owns it and surfaces the last error on shutdown.
 //!
 //! The data model is EAV (entities, concepts, attributes, and versioned facts),
 //! ported from the design sketch. A client sends a *transaction* — a list of

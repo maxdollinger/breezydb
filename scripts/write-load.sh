@@ -82,7 +82,7 @@ fi
 
 echo "==> oha open-loop: $QPS offered tx/s for $DUR"
 oha -z "$DUR" \
-    -c 128 \
+    -c "${CONN:-1024}" \
     -q "$QPS" \
     --latency-correction \
     --no-tui \

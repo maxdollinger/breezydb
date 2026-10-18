@@ -1,8 +1,8 @@
-//! The TursoDB writer thread and the handles that talk to it.
+//! The SQLite writer thread and the handles that talk to it.
 //!
 //! Writes are serialized onto one dedicated OS thread that owns a single
-//! Turso [`Connection`]. That thread is independent of the async worker pool,
-//! so a saturated HTTP server cannot starve it.
+//! [`rusqlite::Connection`] (real SQLite, bundled). That thread is independent
+//! of the async worker pool, so a saturated HTTP server cannot starve it.
 //!
 //! Group commit: the thread drains whatever is queued into one `IMMEDIATE`
 //! SQL transaction and commits it once, so N queued transactions cost one WAL
@@ -12,9 +12,12 @@
 //! rolls back alone while the rest of the batch commits. A failure does not
 //! poison the writer.
 //!
-//! Autocheckpoint is off. A second thread owns its own connection and runs a
-//! `PASSIVE` checkpoint whenever the writer pings it, so the WAL stays bounded
-//! without the writer paying for checkpoints on its commit path.
+//! Autocheckpoint is off (`PRAGMA wal_autocheckpoint=0` — enforced by real
+//! SQLite, unlike Turso where it was a silent no-op and an inline checkpoint
+//! fired every ~1000 frames on the writer's commit path). A second thread owns
+//! its own connection and runs a `PASSIVE` checkpoint when the writer pings
+//! it, so the WAL stays bounded without the writer paying for checkpoints on
+//! its commit path.
 
 use std::fs;
 use std::io;
@@ -22,11 +25,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rusqlite::types::Value;
+use rusqlite::{Connection, TransactionBehavior, params};
 use serde_json::Value as Json;
-use tokio::runtime::Handle as RtHandle;
 use tokio::sync::{mpsc, oneshot};
-use turso::transaction::TransactionBehavior;
-use turso::{Builder, Connection, Error, Statement, Value};
 
 use crate::transaction::{TransactionOp, TransactionResult, run_transaction};
 
@@ -36,8 +38,12 @@ pub const WRITE_QUEUE_DEPTH: usize = 4096;
 /// Cap on bytes absorbed into a single group commit.
 pub const MAX_BATCH_BYTES: usize = 16 << 20;
 
-/// Checkpoint `PASSIVE` normally, `TRUNCATE` once the WAL file passes this.
+/// Cap on WAL file size: past this the writer truncates it (see `writer_loop`).
 pub const WAL_TRUNCATE_BYTES: u64 = 1 << 30;
+
+/// Minimum spacing between the checkpoint thread's `PASSIVE` backfills.
+/// See [`checkpoint_loop`].
+pub const CHECKPOINT_PASSIVE_INTERVAL_MS: u64 = 500;
 
 const CHECKPOINT_PASSIVE: &str = "PRAGMA wal_checkpoint(PASSIVE)";
 const CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
@@ -165,179 +171,178 @@ pub fn schema_for_env() -> String {
         .join("\n")
 }
 
-/// The statements the writer runs. Prepared once, reused for every transaction.
-///
-/// Turso's [`Statement::query`] / [`Statement::execute`] take `&mut self`. The
-/// writer is a single thread that owns these outright, so it threads
-/// `&mut Statements` through instead of reaching for interior mutability.
-pub(crate) struct Statements {
-    open_tx: Statement,
-    insert_entity: Statement,
-    resolve_ref: Statement,
-    close_value: Statement,
-    invalidate_value: Statement,
-    add_fact: Statement,
-    attr_card_one: Statement,
-    savepoint: Statement,
-    release: Statement,
-    rollback_to: Statement,
-    /// When set, skip the per-transaction `SAVEPOINT` (an isolation experiment:
-    /// the savepoint makes the pager page-journal every page a tx touches).
-    no_savepoint: bool,
-}
-
-async fn prepare(conn: &Connection, sql: &str) -> io::Result<Statement> {
-    conn.prepare(sql).await.map_err(to_io)
-}
-
-impl Statements {
-    async fn new(conn: &Connection) -> io::Result<Statements> {
-        Ok(Statements {
-            open_tx: prepare(conn, "INSERT INTO tx DEFAULT VALUES").await?,
-            insert_entity: prepare(
-                conn,
-                "INSERT INTO entity (uuid, created_tx) VALUES (?1, ?2)",
-            )
-            .await?,
-            resolve_ref: prepare(
-                conn,
-                "SELECT e FROM fact WHERE a = ?1 AND v = ?2 AND tx_to IS NULL",
-            )
-            .await?,
-            close_value: prepare(
-                conn,
-                "UPDATE fact SET tx_to = ?3 WHERE e = ?1 AND a = ?2 AND tx_to IS NULL",
-            )
-            .await?,
-            invalidate_value: prepare(
-                conn,
-                "UPDATE fact SET tx_to = ?4 WHERE e = ?1 AND a = ?2 AND v = ?3 AND tx_to IS NULL",
-            )
-            .await?,
-            add_fact: prepare(
-                conn,
-                "INSERT INTO fact (e, a, v, card_one, tx_from) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .await?,
-            attr_card_one: prepare(conn, "SELECT card_one FROM attr WHERE id = ?1").await?,
-            savepoint: prepare(conn, "SAVEPOINT breezy_transaction").await?,
-            release: prepare(conn, "RELEASE breezy_transaction").await?,
-            rollback_to: prepare(conn, "ROLLBACK TO breezy_transaction").await?,
-            no_savepoint: std::env::var("BREEZY_NO_SAVEPOINT").is_ok(),
-        })
+/// The pragmas every breezyDB connection runs. `page_size` only takes effect
+/// on a fresh database file; an existing file keeps its old page size unless
+/// vacuumed. The seeders must run `page_size` themselves before the first
+/// page exists.
+fn pragmas() -> Vec<String> {
+    let mut pragmas: Vec<String> = vec![
+        format!("PRAGMA page_size={};", env_str("BREEZY_PAGE_SIZE", "4096")),
+        format!("PRAGMA synchronous={};", env_str("BREEZY_SYNCHRONOUS", "NORMAL")),
+        "PRAGMA journal_mode=WAL;".to_string(),
+        "PRAGMA wal_autocheckpoint=0;".to_string(),
+        "PRAGMA foreign_keys=ON;".to_string(),
+    ];
+    if let Ok(cs) = std::env::var("BREEZY_CACHE_SIZE") {
+        pragmas.push(format!("PRAGMA cache_size={cs};"));
     }
+    // macOS: `synchronous` decides *when* to sync; `fullfsync` decides *how*.
+    // Without it the sync is plain fsync(), which only reaches the drive cache,
+    // not the media. (F_FULLFSYNC. No-op off Apple, so gate it.)
+    if cfg!(target_vendor = "apple") && std::env::var("BREEZY_FULLFSYNC").is_ok() {
+        pragmas.push("PRAGMA fullfsync=ON;".to_string());
+    }
+    pragmas
+}
+
+/// Run one SQL statement that may return rows (pragmas, checkpoints),
+/// stepping through and discarding them.
+fn run_rows(conn: &Connection, sql: &str) -> io::Result<()> {
+    let mut stmt = conn.prepare(sql).map_err(to_io)?;
+    let mut rows = stmt.query(()).map_err(to_io)?;
+    while rows.next().map_err(to_io)?.is_some() {}
+    Ok(())
+}
+
+/// Run one row-free SQL statement through the per-connection statement cache.
+fn exec(conn: &Connection, sql: &str) -> io::Result<()> {
+    let mut stmt = conn.prepare_cached(sql).map_err(to_io)?;
+    stmt.execute(()).map_err(to_io)?;
+    Ok(())
+}
+
+/// Open a connection with the breezyDB pragmas and busy timeout applied.
+/// `PRAGMA` statements that set a value return no rows; `journal_mode=WAL`
+/// returns one — [`run_rows`] handles both.
+pub fn open_connection(path: &str) -> io::Result<Connection> {
+    let conn = Connection::open(path).map_err(to_io)?;
+    for pragma in pragmas() {
+        run_rows(&conn, &pragma)?;
+    }
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(to_io)?;
+    Ok(conn)
 }
 
 /// A transaction-scoped view of the EAV statements. The `tx` row's id is opened
 /// once per transaction and injected into every write, so callers never pass
 /// `tx_from` / `tx_to` by hand.
 ///
-/// The writer reads generated ids with `last_insert_rowid()` rather than
-/// `INSERT ... RETURNING`: in Turso 0.8.3 `RETURNING` is ~25x slower on this
-/// write path, while `last_insert_rowid()` is free. The `Statement` clones all
-/// share the writer's connection, so the value is visible here right after each
-/// insert.
+/// Statements come from the connection's [`rusqlite::Connection::prepare_cached`]
+/// pool, prepared once and reset per use — same shape the Turso version had
+/// with its own prepared handles.
 pub(crate) struct WriteTx<'a> {
     /// id of the `tx` row opened for this transaction.
     pub id: i64,
-    stmts: &'a mut Statements,
     conn: &'a Connection,
 }
 
 impl WriteTx<'_> {
     /// Create an entity stamped with this transaction; returns its id.
-    pub(crate) async fn insert_entity(&mut self, uuid: &str) -> io::Result<i64> {
-        self.stmts
-            .insert_entity
-            .execute(vec![Value::Text(uuid.to_owned()), Value::Integer(self.id)])
-            .await
+    pub(crate) fn insert_entity(&mut self, uuid: &str) -> io::Result<i64> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("INSERT INTO entity (uuid, created_tx) VALUES (?1, ?2)")
+            .map_err(to_io)?;
+        stmt.execute(params![Value::Text(uuid.to_owned()), Value::Integer(self.id)])
             .map_err(to_io)?;
         Ok(self.conn.last_insert_rowid())
     }
 
     /// Resolve an identity / lookup ref; returns the entity id or `None`.
-    pub(crate) async fn resolve_ref(&mut self, a: i64, v: &Json) -> io::Result<Option<i64>> {
-        let mut rows = self
-            .stmts
-            .resolve_ref
-            .query(vec![Value::Integer(a), json_to_sql(v)])
-            .await
+    pub(crate) fn resolve_ref(&mut self, a: i64, v: &Json) -> io::Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT e FROM fact WHERE a = ?1 AND v = ?2 AND tx_to IS NULL",
+            )
             .map_err(to_io)?;
-        let out: Option<i64> = match rows.next().await.map_err(to_io)? {
+        let mut rows = stmt
+            .query(params![Value::Integer(a), json_to_sql(v)])
+            .map_err(to_io)?;
+        let out: Option<i64> = match rows.next().map_err(to_io)? {
             Some(row) => Some(row.get(0).map_err(to_io)?),
             None => None,
         };
         // Step the statement to completion so it isn't "in progress" at commit.
-        while rows.next().await.map_err(to_io)?.is_some() {}
+        while rows.next().map_err(to_io)?.is_some() {}
         Ok(out)
     }
 
     /// Close the live value of a cardinality-one attribute; returns rows changed.
-    pub(crate) async fn close_value(&mut self, e: i64, a: i64) -> io::Result<usize> {
-        let changed = self
-            .stmts
-            .close_value
-            .execute(vec![
+    pub(crate) fn close_value(&mut self, e: i64, a: i64) -> io::Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "UPDATE fact SET tx_to = ?3 WHERE e = ?1 AND a = ?2 AND tx_to IS NULL",
+            )
+            .map_err(to_io)?;
+        let changed = stmt
+            .execute(params![
                 Value::Integer(e),
                 Value::Integer(a),
-                Value::Integer(self.id),
+                Value::Integer(self.id)
             ])
-            .await
             .map_err(to_io)?;
-        Ok(changed as usize)
+        Ok(changed)
     }
 
     /// Invalidate a specific value of a cardinality-many attribute.
-    pub(crate) async fn invalidate_value(&mut self, e: i64, a: i64, v: &Json) -> io::Result<usize> {
-        let changed = self
-            .stmts
-            .invalidate_value
-            .execute(vec![
+    pub(crate) fn invalidate_value(&mut self, e: i64, a: i64, v: &Json) -> io::Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "UPDATE fact SET tx_to = ?4 WHERE e = ?1 AND a = ?2 AND v = ?3 AND tx_to IS NULL",
+            )
+            .map_err(to_io)?;
+        let changed = stmt
+            .execute(params![
                 Value::Integer(e),
                 Value::Integer(a),
                 json_to_sql(v),
-                Value::Integer(self.id),
+                Value::Integer(self.id)
             ])
-            .await
             .map_err(to_io)?;
-        Ok(changed as usize)
+        Ok(changed)
     }
 
     /// Add a fact stamped with this transaction.
-    pub(crate) async fn add_fact(
+    pub(crate) fn add_fact(
         &mut self,
         e: i64,
         a: i64,
         v: &Json,
         card_one: i64,
     ) -> io::Result<()> {
-        self.stmts
-            .add_fact
-            .execute(vec![
-                Value::Integer(e),
-                Value::Integer(a),
-                json_to_sql(v),
-                Value::Integer(card_one),
-                Value::Integer(self.id),
-            ])
-            .await
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO fact (e, a, v, card_one, tx_from) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
             .map_err(to_io)?;
+        stmt.execute(params![
+            Value::Integer(e),
+            Value::Integer(a),
+            json_to_sql(v),
+            Value::Integer(card_one),
+            Value::Integer(self.id)
+        ])
+        .map_err(to_io)?;
         Ok(())
     }
 
     /// An attribute's cardinality, or `None` if the attribute is unknown.
-    pub(crate) async fn attr_card_one(&mut self, a: i64) -> io::Result<Option<i64>> {
-        let mut rows = self
-            .stmts
-            .attr_card_one
-            .query(vec![Value::Integer(a)])
-            .await
+    pub(crate) fn attr_card_one(&mut self, a: i64) -> io::Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT card_one FROM attr WHERE id = ?1")
             .map_err(to_io)?;
-        let out: Option<i64> = match rows.next().await.map_err(to_io)? {
+        let mut rows = stmt.query(params![Value::Integer(a)]).map_err(to_io)?;
+        let out: Option<i64> = match rows.next().map_err(to_io)? {
             Some(row) => Some(row.get(0).map_err(to_io)?),
             None => None,
         };
-        while rows.next().await.map_err(to_io)?.is_some() {}
+        while rows.next().map_err(to_io)?.is_some() {}
         Ok(out)
     }
 }
@@ -368,58 +373,22 @@ impl Cmd {
 
 /// Open the database, apply the tuning pragmas, create the EAV schema, and
 /// start the writer thread.
-///
-/// The pragmas run on the connection that becomes the writer, before it is
-/// handed to the thread. `page_size` only takes effect on a fresh database
-/// file; an existing file keeps its old page size unless vacuumed.
 pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
     let path = path.as_ref();
     let path_str = path
         .to_str()
         .ok_or_else(|| io::Error::other("database path is not valid UTF-8"))?;
-    let db = Builder::new_local(path_str).build().await.map_err(to_io)?;
-    let conn = db.connect().map_err(to_io)?;
 
-    // Pragmas that return a row (`journal_mode`) cannot go through
-    // `execute_batch`; `pragma_update` drains the result and discards it.
-    let mut pragmas: Vec<(&str, String)> = vec![
-        ("page_size", env_str("BREEZY_PAGE_SIZE", "4096")),
-        ("synchronous", env_str("BREEZY_SYNCHRONOUS", "NORMAL")),
-        ("journal_mode", "WAL".to_string()),
-        ("wal_autocheckpoint", "0".to_string()),
-        ("foreign_keys", "ON".to_string()),
-    ];
-    if let Ok(cs) = std::env::var("BREEZY_CACHE_SIZE") {
-        pragmas.push(("cache_size", cs));
-    }
-    // macOS: `synchronous` decides *when* to sync; `fullfsync` decides *how*.
-    // Without it the sync is plain fsync(), which only reaches the drive cache,
-    // not the media. (F_FULLFSYNC. No-op off Apple, so gate it.)
-    if cfg!(target_vendor = "apple") && std::env::var("BREEZY_FULLFSYNC").is_ok() {
-        pragmas.push(("fullfsync", "ON".to_string()));
-    }
-    for (name, value) in &pragmas {
-        conn.pragma_update(*name, value.as_str())
-            .await
-            .map_err(to_io)?;
-    }
-
+    let conn = open_connection(path_str)?;
     let schema = schema_for_env();
-    conn.execute_batch(&schema).await.map_err(to_io)?;
-    conn.busy_timeout(Duration::from_secs(5)).map_err(to_io)?;
-
-    let stmts = Statements::new(&conn).await?;
-    let checkpoint_conn = db.connect().map_err(to_io)?;
-    let checkpoint_db = db.clone();
+    conn.execute_batch(&schema).map_err(to_io)?;
+    let checkpoint_conn = open_connection(path_str)?;
+    // TRUNCATE needs the exclusive WRITER lock, which the writer holds nearly
+    // continuously under load. A failed attempt must not stall this thread's
+    // PASSIVE backfills behind the default 5s busy retry — fail fast instead.
     checkpoint_conn
-        .busy_timeout(Duration::from_secs(5))
+        .busy_timeout(Duration::from_millis(250))
         .map_err(to_io)?;
-    if cfg!(target_vendor = "apple") && std::env::var("BREEZY_FULLFSYNC").is_ok() {
-        checkpoint_conn
-            .pragma_update("fullfsync", "ON")
-            .await
-            .map_err(to_io)?;
-    }
 
     let wal_path = {
         let mut os = path.as_os_str().to_owned();
@@ -427,27 +396,33 @@ pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
         PathBuf::from(os)
     };
 
-    let rt = RtHandle::current();
     let queue_depth = env_usize("BREEZY_WRITE_QUEUE_DEPTH", WRITE_QUEUE_DEPTH);
     let max_batch_bytes = env_usize("BREEZY_MAX_BATCH_BYTES", MAX_BATCH_BYTES);
     let wal_truncate_bytes = env_u64("BREEZY_WAL_TRUNCATE_BYTES", WAL_TRUNCATE_BYTES);
+    let no_savepoint = std::env::var("BREEZY_NO_SAVEPOINT").is_ok();
     let (tx, rx) = mpsc::channel(queue_depth);
     let (notify_tx, notify_rx) = mpsc::channel::<()>(1);
 
-    let writer_rt = rt.clone();
+    let writer_wal_path = wal_path.clone();
     let writer_join = std::thread::Builder::new()
         .name("storage-writer".into())
         .spawn(move || {
-            let _db = db;
-            writer_loop(conn, stmts, writer_rt, rx, notify_tx, max_batch_bytes)
+            writer_loop(
+                conn,
+                writer_wal_path,
+                rx,
+                notify_tx,
+                max_batch_bytes,
+                wal_truncate_bytes,
+                no_savepoint,
+            )
         })
         .expect("spawn writer thread");
 
     let checkpoint_join = std::thread::Builder::new()
         .name("storage-checkpoint".into())
         .spawn(move || {
-            let _db = checkpoint_db;
-            checkpoint_loop(checkpoint_conn, rt, wal_path, notify_rx, wal_truncate_bytes)
+            checkpoint_loop(checkpoint_conn, notify_rx);
         })
         .expect("spawn checkpoint thread");
 
@@ -462,13 +437,17 @@ pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
 
 fn writer_loop(
     mut conn: Connection,
-    mut stmts: Statements,
-    rt: RtHandle,
+    wal_path: PathBuf,
     mut rx: mpsc::Receiver<Cmd>,
     notify_tx: mpsc::Sender<()>,
     max_batch_bytes: usize,
+    wal_truncate_bytes: u64,
+    no_savepoint: bool,
 ) -> Option<Arc<io::Error>> {
     let mut poison: Option<Arc<io::Error>> = None;
+    let mut last_trunc_log = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(15))
+        .unwrap_or_else(std::time::Instant::now);
 
     while let Some(cmd) = rx.blocking_recv() {
         let mut batch = vec![cmd];
@@ -493,12 +472,33 @@ fn writer_loop(
                 }
                 continue;
             }
-            None => rt.block_on(commit_batch(&mut conn, &mut stmts, batch)),
+            None => commit_batch(&mut conn, batch, no_savepoint),
         };
 
         match res {
             Ok(()) => {
                 let _ = notify_tx.try_send(());
+                // Cap the WAL: truncate from *this* connection, between
+                // transactions. Resetting the log needs the exclusive WAL
+                // WRITER lock, which this thread holds nearly continuously
+                // under load, so an external checkpointer almost always
+                // fails busy (its PASSIVEs still backfill every frame; the
+                // reset is all that's missing). Here the lock is free by
+                // construction, so the truncate succeeds on the first try.
+                if wal_bytes(&wal_path) > wal_truncate_bytes {
+                    match checkpoint_status(&conn, CHECKPOINT_TRUNCATE) {
+                        Ok((busy, _, _)) if busy == 0 => {}
+                        Ok((busy, log, ckpt)) => {
+                            if last_trunc_log.elapsed() >= Duration::from_secs(15) {
+                                last_trunc_log = std::time::Instant::now();
+                                eprintln!(
+                                    "writer wal_checkpoint(TRUNCATE) busy={busy} wal={log} ckpt={ckpt}"
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("writer wal_checkpoint(TRUNCATE) failed: {e}"),
+                    }
+                }
             }
             Err(e) => {
                 let e = Arc::new(e);
@@ -513,26 +513,22 @@ fn writer_loop(
 /// One group commit: every queued transaction in a single `IMMEDIATE` SQL
 /// transaction, each wrapped in a savepoint so a failing transaction rolls back
 /// alone.
-async fn commit_batch(
-    conn: &mut Connection,
-    stmts: &mut Statements,
-    batch: Vec<Cmd>,
-) -> io::Result<()> {
+fn commit_batch(conn: &mut Connection, batch: Vec<Cmd>, no_savepoint: bool) -> io::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .await
         .map_err(to_io)?;
+    let db: &Connection = &tx;
 
     // Run every transaction, remember each result, and only ack after the commit so a
     // commit failure is reported to all waiters instead of a false success.
     let mut pending: Vec<(oneshot::Sender<AckResult>, AckResult)> = Vec::with_capacity(batch.len());
     for cmd in batch {
         let Cmd::Transaction { ops, ack } = cmd;
-        let res = execute_transaction(&tx, stmts, &ops).await;
+        let res = execute_transaction(db, &ops, no_savepoint);
         pending.push((ack, res));
     }
 
-    match tx.commit().await {
+    match tx.commit() {
         Ok(()) => {
             for (ack, res) in pending {
                 let _ = ack.send(res);
@@ -551,76 +547,87 @@ async fn commit_batch(
 
 /// Run one transaction inside its own savepoint: on failure roll back to the
 /// savepoint so the transaction leaves no trace, then release it either way.
-async fn execute_transaction(
-    conn: &Connection,
-    stmts: &mut Statements,
-    ops: &[TransactionOp],
-) -> AckResult {
-    if stmts.no_savepoint {
+fn execute_transaction(conn: &Connection, ops: &[TransactionOp], no_savepoint: bool) -> AckResult {
+    if no_savepoint {
         // Isolation experiment only: no per-tx rollback safety.
-        return transaction_body(conn, stmts, ops).await;
+        return transaction_body(conn, ops);
     }
 
-    stmts.savepoint.execute(()).await.map_err(arc_err)?;
+    exec(conn, "SAVEPOINT breezy_transaction").map_err(arc_err)?;
 
-    match transaction_body(conn, stmts, ops).await {
+    match transaction_body(conn, ops) {
         Ok(result) => {
-            stmts.release.execute(()).await.map_err(arc_err)?;
+            exec(conn, "RELEASE breezy_transaction").map_err(arc_err)?;
             Ok(result)
         }
         Err(e) => {
-            let _ = stmts.rollback_to.execute(()).await;
-            let _ = stmts.release.execute(()).await;
+            let _ = exec(conn, "ROLLBACK TO breezy_transaction");
+            let _ = exec(conn, "RELEASE breezy_transaction");
             Err(e)
         }
     }
 }
 
 /// Open this transaction's `tx` row, then run its ops against the EAV statements.
-async fn transaction_body(
-    conn: &Connection,
-    stmts: &mut Statements,
-    ops: &[TransactionOp],
-) -> AckResult {
-    stmts.open_tx.execute(()).await.map_err(arc_err)?;
+fn transaction_body(conn: &Connection, ops: &[TransactionOp]) -> AckResult {
+    exec(conn, "INSERT INTO tx DEFAULT VALUES").map_err(arc_err)?;
     let id = conn.last_insert_rowid();
 
-    let mut tx = WriteTx { id, stmts, conn };
-    run_transaction(&mut tx, ops).await.map_err(arc_err)
+    let mut tx = WriteTx { id, conn };
+    run_transaction(&mut tx, ops).map_err(arc_err)
 }
 
 /// Checkpointing on its own connection.
 ///
-/// The writer pings `rx` after each commit; capacity-1 `try_send` drops the
-/// ping when one is already queued, so bursts collapse into a single checkpoint.
-/// `PASSIVE` normally, `TRUNCATE` once the WAL file passes [`WAL_TRUNCATE_BYTES`].
-fn checkpoint_loop(
-    conn: Connection,
-    rt: RtHandle,
-    wal_path: PathBuf,
-    mut rx: mpsc::Receiver<()>,
-    wal_truncate_bytes: u64,
-) {
+/// The writer pings `rx` after each commit. `PASSIVE` runs at most once per
+/// [`CHECKPOINT_PASSIVE_INTERVAL_MS`]: it needs no exclusive locks and keeps
+/// the DB file current. Running it on *every* ping instead would hold the
+/// CHECKPOINTER lock nearly continuously under load and starve the writer's
+/// `TRUNCATE` of it.
+///
+/// Capping the WAL is the writer's job (`writer_loop`): resetting/truncating
+/// the log needs the exclusive WAL WRITER lock, which the writer holds almost
+/// continuously under load, so an external checkpointer nearly always fails
+/// busy. Between the writer's own batches the lock is free by construction,
+/// so its `TRUNCATE` succeeds on the first try.
+fn checkpoint_loop(conn: Connection, mut rx: mpsc::Receiver<()>) {
+    let interval = Duration::from_millis(env_u64(
+        "BREEZY_CHECKPOINT_PASSIVE_INTERVAL_MS",
+        CHECKPOINT_PASSIVE_INTERVAL_MS,
+    ));
+    let mut next = std::time::Instant::now();
     while rx.blocking_recv().is_some() {
-        let sql = if wal_bytes(&wal_path) > wal_truncate_bytes {
-            CHECKPOINT_TRUNCATE
-        } else {
-            CHECKPOINT_PASSIVE
-        };
-        if let Err(e) = rt.block_on(checkpoint(&conn, sql)) {
-            eprintln!("wal_checkpoint failed: {e}");
+        let now = std::time::Instant::now();
+        if now < next {
+            // Pings arrive per batch commit — thousands per second under load.
+            // Collapse the burst; the next ping re-arms.
+            continue;
         }
+        next = now + interval;
+        if let Err(e) = run_rows(&conn, CHECKPOINT_PASSIVE) {
+            eprintln!("wal_checkpoint(PASSIVE) failed: {e}");
+        }
+    }
+}
+
+/// `PRAGMA wal_checkpoint` returns `(busy, log, checkpointed)`. `busy != 0`
+/// means it could not complete (locks contended) — the pragma itself still
+/// succeeds, so the rows must be read to notice.
+fn checkpoint_status(conn: &Connection, sql: &str) -> io::Result<(i64, i64, i64)> {
+    let mut stmt = conn.prepare(sql).map_err(to_io)?;
+    let mut rows = stmt.query(()).map_err(to_io)?;
+    match rows.next().map_err(to_io)? {
+        Some(row) => Ok((
+            row.get(0).map_err(to_io)?,
+            row.get(1).map_err(to_io)?,
+            row.get(2).map_err(to_io)?,
+        )),
+        None => Ok((0, 0, 0)),
     }
 }
 
 fn wal_bytes(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-}
-
-async fn checkpoint(conn: &Connection, sql: &str) -> io::Result<()> {
-    let mut rows = conn.query(sql, ()).await.map_err(to_io)?;
-    while rows.next().await.map_err(to_io)?.is_some() {}
-    Ok(())
 }
 
 /// Cloned per task. Every clone feeds the same writer thread.
@@ -700,11 +707,11 @@ fn json_to_sql(v: &Json) -> Value {
     }
 }
 
-fn to_io(e: Error) -> io::Error {
+fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Wrap any error (Turso or io) into the shared error form used by transaction acks.
+/// Wrap any error (rusqlite or io) into the shared error form used by transaction acks.
 fn arc_err<E: std::fmt::Display>(e: E) -> Arc<io::Error> {
     Arc::new(io::Error::other(e.to_string()))
 }

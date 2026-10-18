@@ -69,7 +69,7 @@ pub struct TransactionResult {
 
 /// Execute a list of ops. The caller has already opened the `tx` row, so every
 /// op is stamped with `tx.id`; a throw anywhere aborts the whole transaction.
-pub(crate) async fn run_transaction(
+pub(crate) fn run_transaction(
     tx: &mut WriteTx<'_>,
     ops: &[TransactionOp],
 ) -> io::Result<TransactionResult> {
@@ -98,7 +98,7 @@ pub(crate) async fn run_transaction(
             let r = resolve(&bindings, &$ref)?;
             match r {
                 EntityRef::Id(id) => id,
-                EntityRef::Lookup { a, ref v } => match tx.resolve_ref(a, v).await? {
+                EntityRef::Lookup { a, ref v } => match tx.resolve_ref(a, v)? {
                     Some(id) => id,
                     None => return Err(err(format!("lookup ref not found: a={a}"))),
                 },
@@ -113,7 +113,7 @@ pub(crate) async fn run_transaction(
                 let uuid = uuid
                     .clone()
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let id = tx.insert_entity(&uuid).await?;
+                let id = tx.insert_entity(&uuid)?;
                 if let Some(name) = bind {
                     bindings.insert(name.clone(), id);
                 }
@@ -122,25 +122,25 @@ pub(crate) async fn run_transaction(
 
             TransactionOp::Add { e, a, v } => {
                 let e = entity_id!(e);
-                let card_one = card_one(tx, *a).await?;
-                tx.add_fact(e, *a, v, card_one).await?;
+                let card_one = card_one(tx, *a)?;
+                tx.add_fact(e, *a, v, card_one)?;
                 results.push(json!({ "op": "add", "e": e }));
             }
 
             TransactionOp::Close { e, a } => {
                 let e = entity_id!(e);
-                let changes = tx.close_value(e, *a).await?;
+                let changes = tx.close_value(e, *a)?;
                 results.push(json!({ "op": "close", "e": e, "changes": changes }));
             }
 
             TransactionOp::Invalidate { e, a, v } => {
                 let e = entity_id!(e);
-                let changes = tx.invalidate_value(e, *a, v).await?;
+                let changes = tx.invalidate_value(e, *a, v)?;
                 results.push(json!({ "op": "invalidate", "e": e, "changes": changes }));
             }
 
             TransactionOp::Resolve { a, v, bind } => {
-                let e = match tx.resolve_ref(*a, v).await? {
+                let e = match tx.resolve_ref(*a, v)? {
                     Some(id) => id,
                     None => return Err(err(format!("lookup ref not found: a={a}"))),
                 };
@@ -160,8 +160,8 @@ pub(crate) async fn run_transaction(
 }
 
 /// Reads `attr.card_one` so `add` doesn't make callers supply it.
-async fn card_one(tx: &mut WriteTx<'_>, a: i64) -> io::Result<i64> {
-    match tx.attr_card_one(a).await? {
+fn card_one(tx: &mut WriteTx<'_>, a: i64) -> io::Result<i64> {
+    match tx.attr_card_one(a)? {
         Some(card) => Ok(card),
         None => Err(err(format!("unknown attribute: {a}"))),
     }
