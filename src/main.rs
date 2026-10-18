@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     serve::ListenerExt,
 };
-use breezydb::{FrameOp, Writer, spawn};
+use breezydb::{TransactionOp, Writer, spawn};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
@@ -64,15 +64,17 @@ struct AppState {
     inflight: Arc<Semaphore>,
 }
 
-/// One request === one frame === one transaction. The body is either a bare
-/// array of ops or `{ "ops": [...] }`; see [`FrameOp`] for the op shapes.
+/// One request is one transaction. The body is either a bare array of ops or
+/// `{ "ops": [...] }`; see [`TransactionOp`] for the op shapes.
 async fn tx_handler(State(s): State<AppState>, body: Bytes) -> (StatusCode, Json<Value>) {
     let _permit = match s.inflight.try_acquire_many_owned(OP_BYTES * MAX_OPS as u32) {
         Ok(permit) => permit,
         Err(_) => {
             return (
                 StatusCode::INSUFFICIENT_STORAGE,
-                Json(json!({ "success": false, "error": "too many requests inflight, no memory left" })),
+                Json(
+                    json!({ "success": false, "error": "too many requests inflight, no memory left" }),
+                ),
             );
         }
     };
@@ -91,12 +93,12 @@ async fn tx_handler(State(s): State<AppState>, body: Bytes) -> (StatusCode, Json
         }
     };
 
-    let ops: Vec<FrameOp> = match serde_json::from_value(ops_value) {
+    let ops: Vec<TransactionOp> = match serde_json::from_value(ops_value) {
         Ok(ops) => ops,
         Err(e) => return bad_request(format!("invalid ops: {e}")),
     };
 
-    match s.w.write_frame(ops).await {
+    match s.w.write_transaction(ops).await {
         Ok(result) => (
             StatusCode::OK,
             Json(json!({

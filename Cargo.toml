@@ -15,7 +15,7 @@ axum = { version = "0.8.9", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-libsql = { version = "0.9.30", default-features = false, features = ["core"] }
+turso = "0.8.3"
 
 [profile.release]
 lto = "fat"

@@ -1,4 +1,4 @@
-//! The write API: a *frame* is a list of ops executed in one transaction.
+//! The write API: a *transaction* is a list of ops applied as one unit.
 //!
 //! This is a thin, pure layer over [`WriteTx`]: it resolves entity references,
 //! tracks `as` bindings, and shapes the per-op results. All persistence lives
@@ -12,10 +12,10 @@ use serde_json::{Value, json};
 
 use crate::storage::WriteTx;
 
-/// An entity reference inside a frame.
+/// An entity reference inside a transaction.
 ///
 /// - `number` — a concrete entity id
-/// - `"$name"` — an entity bound earlier in this frame via `as`
+/// - `"$name"` — an entity bound earlier in this transaction via `as`
 /// - `{ a, v }` — a lookup ref, resolved through the identity attribute
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -25,10 +25,10 @@ pub enum EntityRef {
     Lookup { a: i64, v: Value },
 }
 
-/// One operation in a frame. See the README for the op shapes.
+/// One operation in a transaction. See the README for the op shapes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op")]
-pub enum FrameOp {
+pub enum TransactionOp {
     /// Create an entity; `uuid` is generated when omitted. `as` binds its id.
     #[serde(rename = "entity")]
     Entity {
@@ -37,15 +37,15 @@ pub enum FrameOp {
         #[serde(default, rename = "as")]
         bind: Option<String>,
     },
-    /// Assert a fact `(e, a, v)`.
-    #[serde(rename = "assert")]
-    Assert { e: EntityRef, a: i64, v: Value },
+    /// Add a fact `(e, a, v)`.
+    #[serde(rename = "add")]
+    Add { e: EntityRef, a: i64, v: Value },
     /// Close the live value of a cardinality-one attribute.
     #[serde(rename = "close")]
     Close { e: EntityRef, a: i64 },
-    /// Retract a specific value of a cardinality-many attribute.
-    #[serde(rename = "retract")]
-    Retract { e: EntityRef, a: i64, v: Value },
+    /// Invalidate a specific value of a cardinality-many attribute.
+    #[serde(rename = "invalidate")]
+    Invalidate { e: EntityRef, a: i64, v: Value },
     /// Resolve a lookup ref to an entity id; `as` binds the result.
     #[serde(rename = "resolve")]
     Resolve {
@@ -56,10 +56,10 @@ pub enum FrameOp {
     },
 }
 
-/// The outcome of one frame.
+/// The outcome of one transaction.
 #[derive(Debug, Clone, Serialize)]
-pub struct FrameResult {
-    /// id of the `tx` row opened for this frame.
+pub struct TransactionResult {
+    /// id of the `tx` row opened for this transaction.
     pub tx: i64,
     /// Per-op results, in request order.
     pub results: Vec<Value>,
@@ -68,8 +68,11 @@ pub struct FrameResult {
 }
 
 /// Execute a list of ops. The caller has already opened the `tx` row, so every
-/// op is stamped with `tx.id`; a throw anywhere aborts the whole frame.
-pub(crate) async fn run_frame(tx: &WriteTx<'_>, ops: &[FrameOp]) -> io::Result<FrameResult> {
+/// op is stamped with `tx.id`; a throw anywhere aborts the whole transaction.
+pub(crate) async fn run_transaction(
+    tx: &mut WriteTx<'_>,
+    ops: &[TransactionOp],
+) -> io::Result<TransactionResult> {
     let mut bindings: BTreeMap<String, i64> = BTreeMap::new();
     let mut results: Vec<Value> = Vec::with_capacity(ops.len());
 
@@ -106,7 +109,7 @@ pub(crate) async fn run_frame(tx: &WriteTx<'_>, ops: &[FrameOp]) -> io::Result<F
 
     for op in ops {
         match op {
-            FrameOp::Entity { uuid, bind } => {
+            TransactionOp::Entity { uuid, bind } => {
                 let uuid = uuid
                     .clone()
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -117,26 +120,26 @@ pub(crate) async fn run_frame(tx: &WriteTx<'_>, ops: &[FrameOp]) -> io::Result<F
                 results.push(json!({ "op": "entity", "id": id }));
             }
 
-            FrameOp::Assert { e, a, v } => {
+            TransactionOp::Add { e, a, v } => {
                 let e = entity_id!(e);
                 let card_one = card_one(tx, *a).await?;
-                tx.assert_fact(e, *a, v, card_one).await?;
-                results.push(json!({ "op": "assert", "e": e }));
+                tx.add_fact(e, *a, v, card_one).await?;
+                results.push(json!({ "op": "add", "e": e }));
             }
 
-            FrameOp::Close { e, a } => {
+            TransactionOp::Close { e, a } => {
                 let e = entity_id!(e);
                 let changes = tx.close_value(e, *a).await?;
                 results.push(json!({ "op": "close", "e": e, "changes": changes }));
             }
 
-            FrameOp::Retract { e, a, v } => {
+            TransactionOp::Invalidate { e, a, v } => {
                 let e = entity_id!(e);
-                let changes = tx.retract_value(e, *a, v).await?;
-                results.push(json!({ "op": "retract", "e": e, "changes": changes }));
+                let changes = tx.invalidate_value(e, *a, v).await?;
+                results.push(json!({ "op": "invalidate", "e": e, "changes": changes }));
             }
 
-            FrameOp::Resolve { a, v, bind } => {
+            TransactionOp::Resolve { a, v, bind } => {
                 let e = match tx.resolve_ref(*a, v).await? {
                     Some(id) => id,
                     None => return Err(err(format!("lookup ref not found: a={a}"))),
@@ -149,15 +152,15 @@ pub(crate) async fn run_frame(tx: &WriteTx<'_>, ops: &[FrameOp]) -> io::Result<F
         }
     }
 
-    Ok(FrameResult {
+    Ok(TransactionResult {
         tx: tx.id,
         results,
         bindings,
     })
 }
 
-/// Reads `attr.card_one` so `assert` doesn't make callers supply it.
-async fn card_one(tx: &WriteTx<'_>, a: i64) -> io::Result<i64> {
+/// Reads `attr.card_one` so `add` doesn't make callers supply it.
+async fn card_one(tx: &mut WriteTx<'_>, a: i64) -> io::Result<i64> {
     match tx.attr_card_one(a).await? {
         Some(card) => Ok(card),
         None => Err(err(format!("unknown attribute: {a}"))),

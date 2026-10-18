@@ -1,15 +1,16 @@
-//! The libsql writer thread and the handles that talk to it.
+//! The TursoDB writer thread and the handles that talk to it.
 //!
 //! Writes are serialized onto one dedicated OS thread that owns a single
-//! libsql [`Connection`]. That thread is independent of the async worker pool,
+//! Turso [`Connection`]. That thread is independent of the async worker pool,
 //! so a saturated HTTP server cannot starve it.
 //!
 //! Group commit: the thread drains whatever is queued into one `IMMEDIATE`
-//! transaction and commits it once, so N frames cost one WAL fsync. Because the
-//! data model is EAV (a frame asserts/retracts facts, it is not append-only),
-//! each frame still needs its own isolation: every frame runs inside a
-//! `SAVEPOINT`, so a frame that fails rolls back alone while the rest of the
-//! batch commits. A failing frame does not poison the writer.
+//! SQL transaction and commits it once, so N queued transactions cost one WAL
+//! fsync. Because the data model is EAV (a transaction adds/invalidates facts
+//! rather than appending), each queued transaction still needs its own
+//! isolation: every one runs inside a `SAVEPOINT`, so a transaction that fails
+//! rolls back alone while the rest of the batch commits. A failure does not
+//! poison the writer.
 //!
 //! Autocheckpoint is off. A second thread owns its own connection and runs a
 //! `PASSIVE` checkpoint whenever the writer pings it, so the WAL stays bounded
@@ -21,14 +22,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use libsql::{Builder, Connection, Error, Statement, TransactionBehavior, Value};
 use serde_json::Value as Json;
 use tokio::runtime::Handle as RtHandle;
 use tokio::sync::{mpsc, oneshot};
+use turso::transaction::TransactionBehavior;
+use turso::{Builder, Connection, Error, Statement, Value};
 
-use crate::frame::{FrameOp, FrameResult, run_frame};
+use crate::transaction::{TransactionOp, TransactionResult, run_transaction};
 
-/// How many queued frames the writer holds before producers block.
+/// How many queued transactions the writer holds before producers block.
 pub const WRITE_QUEUE_DEPTH: usize = 4096;
 
 /// Cap on bytes absorbed into a single group commit.
@@ -102,14 +104,18 @@ CREATE INDEX IF NOT EXISTS fact_hist ON fact(e, a, tx_from);
 CREATE UNIQUE INDEX IF NOT EXISTS fact_one  ON fact(e, a)    WHERE tx_to IS NULL AND card_one = 1;
 CREATE UNIQUE INDEX IF NOT EXISTS fact_many ON fact(e, a, v) WHERE tx_to IS NULL AND card_one = 0;";
 
-/// The statements the writer runs. Prepared once, reused for every frame.
+/// The statements the writer runs. Prepared once, reused for every transaction.
+///
+/// Turso's [`Statement::query`] / [`Statement::execute`] take `&mut self`. The
+/// writer is a single thread that owns these outright, so it threads
+/// `&mut Statements` through instead of reaching for interior mutability.
 pub(crate) struct Statements {
     open_tx: Statement,
     insert_entity: Statement,
     resolve_ref: Statement,
     close_value: Statement,
-    retract_value: Statement,
-    assert_fact: Statement,
+    invalidate_value: Statement,
+    add_fact: Statement,
     attr_card_one: Statement,
     savepoint: Statement,
     release: Statement,
@@ -123,10 +129,10 @@ async fn prepare(conn: &Connection, sql: &str) -> io::Result<Statement> {
 impl Statements {
     async fn new(conn: &Connection) -> io::Result<Statements> {
         Ok(Statements {
-            open_tx: prepare(conn, "INSERT INTO tx DEFAULT VALUES RETURNING id").await?,
+            open_tx: prepare(conn, "INSERT INTO tx DEFAULT VALUES").await?,
             insert_entity: prepare(
                 conn,
-                "INSERT INTO entity (uuid, created_tx) VALUES (?1, ?2) RETURNING id",
+                "INSERT INTO entity (uuid, created_tx) VALUES (?1, ?2)",
             )
             .await?,
             resolve_ref: prepare(
@@ -139,78 +145,72 @@ impl Statements {
                 "UPDATE fact SET tx_to = ?3 WHERE e = ?1 AND a = ?2 AND tx_to IS NULL",
             )
             .await?,
-            retract_value: prepare(
+            invalidate_value: prepare(
                 conn,
                 "UPDATE fact SET tx_to = ?4 WHERE e = ?1 AND a = ?2 AND v = ?3 AND tx_to IS NULL",
             )
             .await?,
-            assert_fact: prepare(
+            add_fact: prepare(
                 conn,
                 "INSERT INTO fact (e, a, v, card_one, tx_from) VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .await?,
             attr_card_one: prepare(conn, "SELECT card_one FROM attr WHERE id = ?1").await?,
-            savepoint: prepare(conn, "SAVEPOINT breezy_frame").await?,
-            release: prepare(conn, "RELEASE breezy_frame").await?,
-            rollback_to: prepare(conn, "ROLLBACK TO breezy_frame").await?,
+            savepoint: prepare(conn, "SAVEPOINT breezy_transaction").await?,
+            release: prepare(conn, "RELEASE breezy_transaction").await?,
+            rollback_to: prepare(conn, "ROLLBACK TO breezy_transaction").await?,
         })
     }
 }
 
 /// A transaction-scoped view of the EAV statements. The `tx` row's id is opened
-/// once per frame and injected into every write, so callers never pass
+/// once per transaction and injected into every write, so callers never pass
 /// `tx_from` / `tx_to` by hand.
+///
+/// The writer reads generated ids with `last_insert_rowid()` rather than
+/// `INSERT ... RETURNING`: in Turso 0.8.3 `RETURNING` is ~25x slower on this
+/// write path, while `last_insert_rowid()` is free. The `Statement` clones all
+/// share the writer's connection, so the value is visible here right after each
+/// insert.
 pub(crate) struct WriteTx<'a> {
-    /// id of the `tx` row opened for this frame.
+    /// id of the `tx` row opened for this transaction.
     pub id: i64,
-    stmts: &'a Statements,
+    stmts: &'a mut Statements,
+    conn: &'a Connection,
 }
 
 impl WriteTx<'_> {
     /// Create an entity stamped with this transaction; returns its id.
-    pub(crate) async fn insert_entity(&self, uuid: &str) -> io::Result<i64> {
-        self.stmts.insert_entity.reset();
-        let mut rows = self
-            .stmts
+    pub(crate) async fn insert_entity(&mut self, uuid: &str) -> io::Result<i64> {
+        self.stmts
             .insert_entity
-            .query(vec![Value::Text(uuid.to_owned()), Value::Integer(self.id)])
+            .execute(vec![Value::Text(uuid.to_owned()), Value::Integer(self.id)])
             .await
             .map_err(to_io)?;
-        let row = rows
-            .next()
-            .await
-            .map_err(to_io)?
-            .ok_or_else(|| io::Error::other("insertEntity returned no row"))?;
-        let id = row.get(0).map_err(to_io)?;
-        // Finish the step so the statement isn't "in progress" at commit time.
-        drop(rows);
-        self.stmts.insert_entity.reset();
-        Ok(id)
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// Resolve an identity / lookup ref; returns the entity id or `None`.
-    pub(crate) async fn resolve_ref(&self, a: i64, v: &Json) -> io::Result<Option<i64>> {
-        self.stmts.resolve_ref.reset();
+    pub(crate) async fn resolve_ref(&mut self, a: i64, v: &Json) -> io::Result<Option<i64>> {
         let mut rows = self
             .stmts
             .resolve_ref
             .query(vec![Value::Integer(a), json_to_sql(v)])
             .await
             .map_err(to_io)?;
-        let out = match rows.next().await.map_err(to_io)? {
+        let out: Option<i64> = match rows.next().await.map_err(to_io)? {
             Some(row) => Some(row.get(0).map_err(to_io)?),
             None => None,
         };
-        // Finish the step so the statement isn't "in progress" at commit time.
-        drop(rows);
-        self.stmts.resolve_ref.reset();
+        // Step the statement to completion so it isn't "in progress" at commit.
+        while rows.next().await.map_err(to_io)?.is_some() {}
         Ok(out)
     }
 
     /// Close the live value of a cardinality-one attribute; returns rows changed.
-    pub(crate) async fn close_value(&self, e: i64, a: i64) -> io::Result<usize> {
-        self.stmts.close_value.reset();
-        self.stmts
+    pub(crate) async fn close_value(&mut self, e: i64, a: i64) -> io::Result<usize> {
+        let changed = self
+            .stmts
             .close_value
             .execute(vec![
                 Value::Integer(e),
@@ -218,14 +218,15 @@ impl WriteTx<'_> {
                 Value::Integer(self.id),
             ])
             .await
-            .map_err(to_io)
+            .map_err(to_io)?;
+        Ok(changed as usize)
     }
 
-    /// Retract a specific value of a cardinality-many attribute.
-    pub(crate) async fn retract_value(&self, e: i64, a: i64, v: &Json) -> io::Result<usize> {
-        self.stmts.retract_value.reset();
-        self.stmts
-            .retract_value
+    /// Invalidate a specific value of a cardinality-many attribute.
+    pub(crate) async fn invalidate_value(&mut self, e: i64, a: i64, v: &Json) -> io::Result<usize> {
+        let changed = self
+            .stmts
+            .invalidate_value
             .execute(vec![
                 Value::Integer(e),
                 Value::Integer(a),
@@ -233,14 +234,20 @@ impl WriteTx<'_> {
                 Value::Integer(self.id),
             ])
             .await
-            .map_err(to_io)
+            .map_err(to_io)?;
+        Ok(changed as usize)
     }
 
-    /// Assert a fact stamped with this transaction.
-    pub(crate) async fn assert_fact(&self, e: i64, a: i64, v: &Json, card_one: i64) -> io::Result<()> {
-        self.stmts.assert_fact.reset();
+    /// Add a fact stamped with this transaction.
+    pub(crate) async fn add_fact(
+        &mut self,
+        e: i64,
+        a: i64,
+        v: &Json,
+        card_one: i64,
+    ) -> io::Result<()> {
         self.stmts
-            .assert_fact
+            .add_fact
             .execute(vec![
                 Value::Integer(e),
                 Value::Integer(a),
@@ -254,30 +261,28 @@ impl WriteTx<'_> {
     }
 
     /// An attribute's cardinality, or `None` if the attribute is unknown.
-    pub(crate) async fn attr_card_one(&self, a: i64) -> io::Result<Option<i64>> {
-        self.stmts.attr_card_one.reset();
+    pub(crate) async fn attr_card_one(&mut self, a: i64) -> io::Result<Option<i64>> {
         let mut rows = self
             .stmts
             .attr_card_one
             .query(vec![Value::Integer(a)])
             .await
             .map_err(to_io)?;
-        let out = match rows.next().await.map_err(to_io)? {
+        let out: Option<i64> = match rows.next().await.map_err(to_io)? {
             Some(row) => Some(row.get(0).map_err(to_io)?),
             None => None,
         };
-        drop(rows);
-        self.stmts.attr_card_one.reset();
+        while rows.next().await.map_err(to_io)?.is_some() {}
         Ok(out)
     }
 }
 
-/// A batch of queued frames plus the channel each result is delivered on.
-type AckResult = Result<FrameResult, Arc<io::Error>>;
+/// A batch of queued transactions plus the channel each result is delivered on.
+type AckResult = Result<TransactionResult, Arc<io::Error>>;
 
 enum Cmd {
-    Frame {
-        ops: Vec<FrameOp>,
+    Transaction {
+        ops: Vec<TransactionOp>,
         ack: oneshot::Sender<AckResult>,
     },
 }
@@ -285,13 +290,13 @@ enum Cmd {
 impl Cmd {
     fn bytes(&self) -> usize {
         match self {
-            Cmd::Frame { ops, .. } => serde_json::to_vec(ops).map(|b| b.len()).unwrap_or(0),
+            Cmd::Transaction { ops, .. } => serde_json::to_vec(ops).map(|b| b.len()).unwrap_or(0),
         }
     }
 
     fn ack(self) -> oneshot::Sender<AckResult> {
         match self {
-            Cmd::Frame { ack, .. } => ack,
+            Cmd::Transaction { ack, .. } => ack,
         }
     }
 }
@@ -304,23 +309,29 @@ impl Cmd {
 /// file; an existing file keeps its old page size unless vacuumed.
 pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
     let path = path.as_ref();
-    let db = Builder::new_local(path).build().await.map_err(to_io)?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| io::Error::other("database path is not valid UTF-8"))?;
+    let db = Builder::new_local(path_str).build().await.map_err(to_io)?;
     let conn = db.connect().map_err(to_io)?;
 
-    conn.execute_batch(
-        "PRAGMA page_size = 4096;
-         PRAGMA synchronous = NORMAL;
-         PRAGMA journal_mode = WAL;
-         PRAGMA wal_autocheckpoint = 0;
-         PRAGMA foreign_keys = ON;",
-    )
-    .await
-    .map_err(to_io)?;
+    // Pragmas that return a row (`journal_mode`) cannot go through
+    // `execute_batch`; `pragma_update` drains the result and discards it.
+    for (name, value) in [
+        ("page_size", "16384"),
+        ("synchronous", "NORMAL"),
+        ("journal_mode", "WAL"),
+        ("wal_autocheckpoint", "0"),
+        ("foreign_keys", "ON"),
+    ] {
+        conn.pragma_update(name, value).await.map_err(to_io)?;
+    }
     conn.execute_batch(DB_SCHEMA).await.map_err(to_io)?;
     conn.busy_timeout(Duration::from_secs(5)).map_err(to_io)?;
 
     let stmts = Statements::new(&conn).await?;
     let checkpoint_conn = db.connect().map_err(to_io)?;
+    let checkpoint_db = db.clone();
     checkpoint_conn
         .busy_timeout(Duration::from_secs(5))
         .map_err(to_io)?;
@@ -346,7 +357,10 @@ pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
 
     let checkpoint_join = std::thread::Builder::new()
         .name("storage-checkpoint".into())
-        .spawn(move || checkpoint_loop(checkpoint_conn, rt, wal_path, notify_rx))
+        .spawn(move || {
+            let _db = checkpoint_db;
+            checkpoint_loop(checkpoint_conn, rt, wal_path, notify_rx)
+        })
         .expect("spawn checkpoint thread");
 
     Ok((
@@ -359,8 +373,8 @@ pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
 }
 
 fn writer_loop(
-    conn: Connection,
-    stmts: Statements,
+    mut conn: Connection,
+    mut stmts: Statements,
     rt: RtHandle,
     mut rx: mpsc::Receiver<Cmd>,
     notify_tx: mpsc::Sender<()>,
@@ -383,14 +397,14 @@ fn writer_loop(
 
         let res: io::Result<()> = match poison.clone() {
             Some(e) => {
-                // The connection is already dead; fail every waiter, per frame.
+                // The connection is already dead; fail every waiter, per transaction.
                 let e = Arc::new(io::Error::new(e.kind(), e.to_string()));
                 for cmd in batch {
                     let _ = cmd.ack().send(Err(Arc::clone(&e)));
                 }
                 continue;
             }
-            None => rt.block_on(commit_batch(&conn, &stmts, batch)),
+            None => rt.block_on(commit_batch(&mut conn, &mut stmts, batch)),
         };
 
         match res {
@@ -407,20 +421,25 @@ fn writer_loop(
     poison
 }
 
-/// One group commit: every queued frame in a single `IMMEDIATE` transaction,
-/// each wrapped in a savepoint so a failing frame rolls back alone.
-async fn commit_batch(conn: &Connection, stmts: &Statements, batch: Vec<Cmd>) -> io::Result<()> {
+/// One group commit: every queued transaction in a single `IMMEDIATE` SQL
+/// transaction, each wrapped in a savepoint so a failing transaction rolls back
+/// alone.
+async fn commit_batch(
+    conn: &mut Connection,
+    stmts: &mut Statements,
+    batch: Vec<Cmd>,
+) -> io::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await
         .map_err(to_io)?;
 
-    // Run every frame, remember each result, and only ack after the commit so a
+    // Run every transaction, remember each result, and only ack after the commit so a
     // commit failure is reported to all waiters instead of a false success.
     let mut pending: Vec<(oneshot::Sender<AckResult>, AckResult)> = Vec::with_capacity(batch.len());
     for cmd in batch {
-        let Cmd::Frame { ops, ack } = cmd;
-        let res = execute_frame(stmts, &ops).await;
+        let Cmd::Transaction { ops, ack } = cmd;
+        let res = execute_transaction(&tx, stmts, &ops).await;
         pending.push((ack, res));
     }
 
@@ -441,44 +460,39 @@ async fn commit_batch(conn: &Connection, stmts: &Statements, batch: Vec<Cmd>) ->
     }
 }
 
-/// Run one frame inside its own savepoint: on failure roll back to the
-/// savepoint so the frame leaves no trace, then release it either way.
-async fn execute_frame(stmts: &Statements, ops: &[FrameOp]) -> AckResult {
-    stmts.savepoint.reset();
+/// Run one transaction inside its own savepoint: on failure roll back to the
+/// savepoint so the transaction leaves no trace, then release it either way.
+async fn execute_transaction(
+    conn: &Connection,
+    stmts: &mut Statements,
+    ops: &[TransactionOp],
+) -> AckResult {
     stmts.savepoint.execute(()).await.map_err(arc_err)?;
 
-    match frame_body(stmts, ops).await {
+    match transaction_body(conn, stmts, ops).await {
         Ok(result) => {
-            stmts.release.reset();
             stmts.release.execute(()).await.map_err(arc_err)?;
             Ok(result)
         }
         Err(e) => {
-            stmts.rollback_to.reset();
             let _ = stmts.rollback_to.execute(()).await;
-            stmts.release.reset();
             let _ = stmts.release.execute(()).await;
             Err(e)
         }
     }
 }
 
-/// Open this frame's `tx` row, then run its ops against the EAV statements.
-async fn frame_body(stmts: &Statements, ops: &[FrameOp]) -> AckResult {
-    stmts.open_tx.reset();
-    let mut rows = stmts.open_tx.query(()).await.map_err(arc_err)?;
-    let row = rows
-        .next()
-        .await
-        .map_err(arc_err)?
-        .ok_or_else(no_tx_row_err)?;
-    let id: i64 = row.get(0).map_err(arc_err)?;
-    // Finish the step so the statement isn't "in progress" at commit time.
-    drop(rows);
-    stmts.open_tx.reset();
+/// Open this transaction's `tx` row, then run its ops against the EAV statements.
+async fn transaction_body(
+    conn: &Connection,
+    stmts: &mut Statements,
+    ops: &[TransactionOp],
+) -> AckResult {
+    stmts.open_tx.execute(()).await.map_err(arc_err)?;
+    let id = conn.last_insert_rowid();
 
-    let tx = WriteTx { id, stmts };
-    run_frame(&tx, ops).await.map_err(arc_err)
+    let mut tx = WriteTx { id, stmts, conn };
+    run_transaction(&mut tx, ops).await.map_err(arc_err)
 }
 
 /// Checkpointing on its own connection.
@@ -516,11 +530,14 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Queue one frame and wait for its result.
-    pub async fn write_frame(&self, ops: Vec<FrameOp>) -> io::Result<FrameResult> {
+    /// Queue one transaction and wait for its result.
+    pub async fn write_transaction(
+        &self,
+        ops: Vec<TransactionOp>,
+    ) -> io::Result<TransactionResult> {
         let (ack, done) = oneshot::channel();
         self.tx
-            .send(Cmd::Frame { ops, ack })
+            .send(Cmd::Transaction { ops, ack })
             .await
             .map_err(|_| io::Error::other("failed channel send"))?;
         match done.await {
@@ -587,13 +604,9 @@ fn to_io(e: Error) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Wrap any error (libsql or io) into the shared error form used by frame acks.
+/// Wrap any error (Turso or io) into the shared error form used by transaction acks.
 fn arc_err<E: std::fmt::Display>(e: E) -> Arc<io::Error> {
     Arc::new(io::Error::other(e.to_string()))
-}
-
-fn no_tx_row_err() -> Arc<io::Error> {
-    arc_err(io::Error::other("failed to open transaction row"))
 }
 
 /// `io::Error` is not `Clone`, and the batch fan-out needs one error per waiter.

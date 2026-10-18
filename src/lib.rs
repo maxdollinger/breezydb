@@ -1,5 +1,5 @@
-pub mod frame;
 pub mod storage;
+pub mod transaction;
 
-pub use frame::{EntityRef, FrameOp, FrameResult};
 pub use storage::{Handle, Writer, spawn};
+pub use transaction::{EntityRef, TransactionOp, TransactionResult};

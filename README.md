@@ -8,12 +8,12 @@
 
 ## Write API
 
-One request is one **frame**: a list of ops executed in a single transaction.
+One request is one **transaction**: a list of ops applied atomically.
 
 ```sh
 curl -X POST localhost:3000/tx -H 'content-type: application/json' -d '[
   {"op":"entity","uuid":"e1","as":"$e"},
-  {"op":"assert","e":"$e","a":2,"v":"Mad Max"}
+  {"op":"add","e":"$e","a":2,"v":"Mad Max"}
 ]'
 ```
 
@@ -22,31 +22,32 @@ The body is a bare array of ops or `{ "ops": [...] }`. Ops:
 | op | shape | effect |
 |---|---|---|
 | `entity` | `{uuid?, as?}` | create an entity (uuid generated if omitted), optionally bind its id |
-| `assert` | `{e, a, v}` | assert a fact `(e, a, v)` |
+| `add` | `{e, a, v}` | add a fact `(e, a, v)` |
 | `close` | `{e, a}` | close the live value of a cardinality-one attribute |
-| `retract` | `{e, a, v}` | retract a specific value of a cardinality-many attribute |
+| `invalidate` | `{e, a, v}` | invalidate a specific value of a cardinality-many attribute |
 | `resolve` | `{a, v, as?}` | resolve a lookup ref via the identity attribute |
 
 An entity ref (`e`) is a numeric id, a `"$name"` binding from an earlier `as`,
 or a lookup ref `{a, v}`. The response carries the `tx` id, per-op `results`,
-and the `bindings`. A failing op aborts the whole frame with HTTP 409 and rolls
-it back; other frames are unaffected.
+and the `bindings`. A failing op aborts the whole transaction with HTTP 409 and rolls
+it back; other transactions are unaffected.
 
 The data model is EAV (`concept`/`attr`/`entity`/`fact`, with `fact` versioned
-by `tx_from`/`tx_to`). Concepts and attributes are seeded out of band (see
-`sketch/loadtest/seed.ts` for the shape).
+by `tx_from`/`tx_to`). Concepts and attributes are seeded out of band (see the
+`seed` example, `examples/seed.rs`, for the shape).
 
 ## Storage Engine
 
-**Current implementation (MVP).** A single writer thread owns one libsql
-connection; writes arrive on a bounded queue, and whatever is queued is drained
-into one `IMMEDIATE` transaction (group commit). Each frame runs inside its own
-`SAVEPOINT`, so one failing frame rolls back alone without poisoning the batch.
-A second thread runs `PASSIVE` checkpoints off the commit path, switching to
-`TRUNCATE` once the WAL passes 1 GiB. The connection uses `page_size = 4096`,
-`synchronous = NORMAL`, WAL, and `wal_autocheckpoint = 0`.
+**Current implementation (MVP).** A single writer thread owns one TursoDB
+([`turso`](https://crates.io/crates/turso) 0.8.3) connection; writes arrive on a
+bounded queue, and whatever is queued is drained into one `IMMEDIATE`
+transaction (group commit). Each transaction runs inside its own `SAVEPOINT`, so one
+failing transaction rolls back alone without poisoning the batch. A second thread runs
+`PASSIVE` checkpoints off the commit path, switching to `TRUNCATE` once the WAL
+passes 1 GiB. The connection uses `page_size = 4096`, `synchronous = NORMAL`,
+WAL, and `wal_autocheckpoint = 0`.
 
-**Planned.** Replace libsql with the native format below:
+**Planned.** Replace TursoDB with the native format below:
 
 - Single Writer, multiple readers
 - No WAL, multiple append only files, with merging of sealed files
@@ -65,78 +66,112 @@ A second thread runs `PASSIVE` checkpoints off the commit path, switching to
 ## Load testing
 
 The server reads `DB` (default `data/test.db`) and `PORT` (default `3000`), so it
-can be pointed at a scratch file. The sketch's zero-dependency open-loop runner
-works against it unchanged (`openloop.ts` substitutes `$RANDOM` per request):
+can be pointed at a scratch file. Seed concepts/attributes out of band first —
+the write path does not create them. The `seed` example opens the same file and
+applies the schema plus a concept and a `name` attribute:
 
 ```sh
-cargo build --release
+# build both the server and the seed helper (a bare
+# `cargo build --release --example seed` builds only the example, not the bin)
+cargo build --release --bin breezydb --example seed
+rm -f /tmp/breezy-load.db*
+./target/release/examples/seed /tmp/breezy-load.db
 DB=/tmp/breezy-load.db PORT=3000 ./target/release/breezydb &
-
-# seed concepts/attrs (the write path does not create them)
-sqlite3 /tmp/breezy-load.db "
-  INSERT INTO concept (id,ident) VALUES (1,'node');
-  INSERT INTO concept_ancestor (concept,ancestor) VALUES (1,1);
-  INSERT INTO attr (id,ident,domain,value_type,range,card_one,is_unique,is_identity)
-    VALUES (2,'name',1,'string',NULL,1,0,0);"
-
-cd sketch
-# pure server (no DB)
-bun run loadtest/openloop.ts http://localhost:3000/noop 5000 15
-# DB write path: one entity + one fact per request
-METHOD=POST HEADER='content-type: application/json' \
-  BODY='{"ops":[{"op":"entity","uuid":"$RANDOM","as":"$e"},{"op":"assert","e":"$e","a":2,"v":"load"}]}' \
-  bun run loadtest/openloop.ts http://localhost:3000/tx 1000 10
 ```
 
-The Bun client saturates at ~24 k req/s on loopback and hides the server's real
-ceiling. For actual capacity numbers use a compiled generator. `wrk` needs no
-per-request body: omit `uuid` so the server generates it, which keeps every
-entity unique with a static body.
+Load is generated with [`oha`](https://github.com/hatoo/oha). Its `-q` flag
+sends requests at a fixed rate *independent of responses* and
+`--latency-correction` compensates for coordinated omission, so it is a true
+open-loop driver rather than a closed-loop one:
 
 ```sh
-cat > /tmp/post.lua <<'LUA'
-wrk.method = "POST"
-wrk.headers["Content-Type"] = "application/json"
-wrk.body = '{"ops":[{"op":"entity","as":"$e"},{"op":"assert","e":"$e","a":2,"v":"load"}]}'
-LUA
-wrk -t4 -c128 -d10s --latency -s /tmp/post.lua http://localhost:3000/tx
+# pure server (no DB), open-loop
+oha -z 10s -c 128 -q 50000 --latency-correction --no-tui \
+  http://127.0.0.1:3000/noop
+
+# DB write path: one entity + one fact per request.
+# Omit `uuid` so the server generates it — keeps every entity unique from a
+# static body.
+BODY='{"ops":[{"op":"entity","as":"$e"},{"op":"add","e":"$e","a":2,"v":"load"}]}'
+
+# open-loop at a fixed 40 k offered transactions/s
+oha -z 10s -c 128 -q 40000 --latency-correction --no-tui \
+  -m POST -T application/json -d "$BODY" http://127.0.0.1:3000/tx
+
+# closed-loop (max throughput): drop -q and --latency-correction
+oha -z 6s -c 128 --no-tui -m POST -T application/json -d "$BODY" \
+  http://127.0.0.1:3000/tx
 ```
 
-Measurements on macOS (aarch64, release build) with `synchronous = NORMAL` and
-`page_size = 4096`, driven by `wrk`:
+`localhost` resolves to IPv6 (`::1`) on macOS while the server binds IPv4 only,
+so point the load generator at `127.0.0.1`.
 
-- `GET /noop` — ~53 k req/s, p99 2.5 ms.
-- `POST /tx` (one entity + one fact) — ~30 k frames/s, p50 4.4 ms, p99 9 ms, 0
-  failures. Throughput plateaus across c=32–256 connections, so the server — not
-  the client — is the cap.
+Measurements on macOS (aarch64, release build, TursoDB 0.8.3) with
+`synchronous = NORMAL` and `page_size = 4096`, driven by `oha`:
 
-**The single writer thread is the limit — not JSON, HTTP, or the checkpoint.**
-Under `/tx` load the `storage-writer` thread is ~93% busy on one core while the
-16 tokio workers sit at ~8% each. Probe routes running the exact `/tx` parse
-path without storage (including its current double-then-typed parse) hit the same
-~53 k as `/noop`, so JSON parsing is free at this shape; only the DB costs.
+- `GET /noop` **offered 50 k req/s** (open-loop) — keeps up, p50 2.3 ms, p99
+  19 ms. Closed-loop it tops out at ~49.7 k, p99 3.2 ms.
+- `POST /tx` (one entity + one fact) **closed-loop** (`-c 128`) — **~43 k
+  transactions/s**, p50 2.9 ms, p95 3.3 ms, p99 3.7 ms, 0 failures.
 
-That writer CPU is dominated by **index maintenance on `fact`**. Dropping the
-four secondary indexes (`fact_eav`, `fact_ave`, `fact_hist`, `fact_one`) lifts
-`/tx` from ~28 k to ~47 k. Base inserts, the per-frame `SAVEPOINT`, group commit,
-and HTTP are minor by comparison — removing the savepoint entirely changed
-nothing.
+Open-loop, the knee is around **~42–43 k transactions/s**. The server absorbs the
+offered rate with a flat p50 until it reaches the ceiling, then the fixed
+offered rate outruns the writer and the queue inflates the tail while the
+*achieved* rate stays pinned:
 
-This ceiling is **accepted, not a target**. The indexes are required for the
-read/query paths, and ~20–30 k write tx/s from a single writer is comfortably
-enough for the workloads this is aimed at. The numbers above are to understand
-where the floor is, not to remove indexes. The planned native format's opt-in
-"search buckets" would raise it later without changing the write model.
+| offered /tx | achieved | p50 | p95 | p99 |
+|---|---|---|---|---|
+| 20 k | 20.0 k | 1.1 ms | 2.0 ms | 27 ms |
+| 30 k | 30.0 k | 1.3 ms | 11.3 ms | 40 ms |
+| 40 k | 40.0 k | 1.7 ms | 16.3 ms | 31 ms |
+| 44 k | 43.3 k | 23 ms | 84 ms | 92 ms |
+| 48 k | 43.2 k | 257 ms | 567 ms | 596 ms |
 
-Page size is the other dominant knob. At `page_size = 65536` each dirty page
-writes a 64 KiB WAL frame, the WAL ballooned to ~1.4 GB in 6 s and tripped the
-1 GiB `TRUNCATE` checkpoint, and the writer managed only ~12 k frames/s. At 4096
-the WAL stays ~30× smaller and throughput roughly doubles.
+### Turso tuning notes
 
-Automatic checkpoint/truncation (`wal_autocheckpoint = 1000` +
-`journal_size_limit = 4 MB`, custom thread off) pins the WAL at ~4 MB but is
-slower and heavier-tailed — the frequent truncations cost more than they save.
-The custom `PASSIVE` thread (TRUNCATE only past 1 GiB) is kept.
+The single biggest knob was not a pragma: **avoid `INSERT ... RETURNING`**. On
+Turso 0.8.3 the transaction path's two `INSERT ... RETURNING id` statements ran at
+~2.4 k transactions/s; replacing them with plain `INSERT` + `last_insert_rowid()`
+(see `WriteTx`) took the same workload to **~53 k transactions/s** storage-only and
+~43 k over HTTP — roughly **25x**. No savepoint, index, or pragma change came
+close. (Values are read off the writer's connection, which the pre-prepared
+statement clones share.)
+
+Everything else measured was noise or a regression (`/tx`, closed-loop):
+
+| change | transactions/s |
+|---|---|
+| baseline (WAL, `synchronous=NORMAL`, `page_size=4096`, all indexes) | 41.8 k |
+| `synchronous = OFF` | 41.9 k |
+| `cache_size = 512 MiB` | 41.9 k |
+| `page_size = 65536` | 42.8 k |
+| drop the 4 secondary `fact` indexes | 42.8 k |
+| **remove the checkpoint thread** | **29.7 k** |
+
+So the pragmas do nothing here, the secondary indexes are nearly free, and the
+custom `PASSIVE` checkpoint thread is worth keeping — without it the WAL grows
+unchecked and throughput drops ~30%. The defaults are kept.
+
+**Where the ceiling is now.** `/tx` (~43 k) sits close to `/noop` (~50 k), so
+after the `RETURNING` fix the single writer is no longer dramatically ahead of
+everything else — the remaining gap is the per-transaction statement work (six
+statements: savepoint, `tx`, entity, `attr` lookup, fact, release) spread over
+one thread. It is comfortably enough for the workloads this is aimed at, and the
+planned native format's opt-in "search buckets" would raise it later without
+changing the write model.
+
+Page size is a mild knob. At `page_size = 65536` each dirty page writes a 64 KiB
+WAL frame, so the WAL balloons and trips the 1 GiB `TRUNCATE` checkpoint; the
+throughput gain is within noise, so 4096 stays. Automatic
+checkpoint/truncation (`wal_autocheckpoint = 1000` + `journal_size_limit = 4 MB`,
+custom thread off) pins the WAL but is slower and heavier-tailed; the custom
+`PASSIVE` thread (TRUNCATE only past 1 GiB) is kept.
+
+> Earlier revisions of this section reported ~27 k transactions/s and a ~23.5 k
+> open-loop knee. Those numbers came from a stale `target/release/breezydb`
+> left over from the libsql backend — `cargo build --release --example seed`
+> builds the example, not the binary. The figures above are the actual TursoDB
+> build.
 
 ## State
 
