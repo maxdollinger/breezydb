@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "INSERT OR IGNORE INTO concept (id, ident) VALUES (1, 'node');
          INSERT OR IGNORE INTO concept_ancestor (concept, ancestor) VALUES (1, 1);
          INSERT OR IGNORE INTO attr (id, ident, domain, value_type, range, card_one, is_unique, is_identity)
-           VALUES (2, 'name', 1, 'string', NULL, 1, 0, 0);",
+           VALUES (2, 'node/name', 1, 'string', NULL, 1, 0, 0);",
     )
     .await?;
 

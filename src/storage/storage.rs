@@ -42,6 +42,26 @@ pub const WAL_TRUNCATE_BYTES: u64 = 1 << 30;
 const CHECKPOINT_PASSIVE: &str = "PRAGMA wal_checkpoint(PASSIVE)";
 const CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 
+// Tuning knobs, overridable by env var so the load harness can sweep them
+// without a rebuild. Defaults are the shipped values.
+fn env_str(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 /// The EAV schema. Ported from the design sketch. Every statement is
 /// `IF NOT EXISTS` so opening an existing database is idempotent.
 pub const DB_SCHEMA: &str = "\
@@ -100,9 +120,50 @@ CREATE TABLE IF NOT EXISTS fact (
 
 CREATE INDEX IF NOT EXISTS fact_eav  ON fact(e, a, v) WHERE tx_to IS NULL;
 CREATE INDEX IF NOT EXISTS fact_ave  ON fact(a, v, e) WHERE tx_to IS NULL;
-CREATE INDEX IF NOT EXISTS fact_hist ON fact(e, a, tx_from);
 CREATE UNIQUE INDEX IF NOT EXISTS fact_one  ON fact(e, a)    WHERE tx_to IS NULL AND card_one = 1;
 CREATE UNIQUE INDEX IF NOT EXISTS fact_many ON fact(e, a, v) WHERE tx_to IS NULL AND card_one = 0;";
+
+/// Drop every `CREATE [UNIQUE] INDEX` line. Used by the `BREEZY_NO_FACT_INDEXES`
+/// experiment to isolate secondary-index maintenance on the write path.
+pub fn schema_without_fact_indexes(schema: &str) -> String {
+    schema
+        .lines()
+        .filter(|l| {
+            let l = l.trim_start().to_ascii_uppercase();
+            !l.starts_with("CREATE INDEX") && !l.starts_with("CREATE UNIQUE INDEX")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The schema the server and the seeder should use, honoring the index
+/// experiments:
+///
+/// - `BREEZY_NO_FACT_INDEXES` — drop all secondary indexes.
+/// - `BREEZY_DROP_FACT_INDEXES=a,b` — drop only the named indexes (e.g.
+///   `fact_hist`), so the cost can be attributed index by index.
+pub fn schema_for_env() -> String {
+    if std::env::var("BREEZY_NO_FACT_INDEXES").is_ok() {
+        return schema_without_fact_indexes(DB_SCHEMA);
+    }
+    let Ok(list) = std::env::var("BREEZY_DROP_FACT_INDEXES") else {
+        return DB_SCHEMA.to_string();
+    };
+    let names: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    DB_SCHEMA
+        .lines()
+        .filter(|l| {
+            let up = l.trim_start().to_ascii_uppercase();
+            let is_index = up.starts_with("CREATE INDEX") || up.starts_with("CREATE UNIQUE INDEX");
+            !is_index || !names.iter().any(|n| l.contains(n))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// The statements the writer runs. Prepared once, reused for every transaction.
 ///
@@ -120,6 +181,9 @@ pub(crate) struct Statements {
     savepoint: Statement,
     release: Statement,
     rollback_to: Statement,
+    /// When set, skip the per-transaction `SAVEPOINT` (an isolation experiment:
+    /// the savepoint makes the pager page-journal every page a tx touches).
+    no_savepoint: bool,
 }
 
 async fn prepare(conn: &Connection, sql: &str) -> io::Result<Statement> {
@@ -159,6 +223,7 @@ impl Statements {
             savepoint: prepare(conn, "SAVEPOINT breezy_transaction").await?,
             release: prepare(conn, "RELEASE breezy_transaction").await?,
             rollback_to: prepare(conn, "ROLLBACK TO breezy_transaction").await?,
+            no_savepoint: std::env::var("BREEZY_NO_SAVEPOINT").is_ok(),
         })
     }
 }
@@ -317,16 +382,30 @@ pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
 
     // Pragmas that return a row (`journal_mode`) cannot go through
     // `execute_batch`; `pragma_update` drains the result and discards it.
-    for (name, value) in [
-        ("page_size", "16384"),
-        ("synchronous", "NORMAL"),
-        ("journal_mode", "WAL"),
-        ("wal_autocheckpoint", "0"),
-        ("foreign_keys", "ON"),
-    ] {
-        conn.pragma_update(name, value).await.map_err(to_io)?;
+    let mut pragmas: Vec<(&str, String)> = vec![
+        ("page_size", env_str("BREEZY_PAGE_SIZE", "4096")),
+        ("synchronous", env_str("BREEZY_SYNCHRONOUS", "NORMAL")),
+        ("journal_mode", "WAL".to_string()),
+        ("wal_autocheckpoint", "0".to_string()),
+        ("foreign_keys", "ON".to_string()),
+    ];
+    if let Ok(cs) = std::env::var("BREEZY_CACHE_SIZE") {
+        pragmas.push(("cache_size", cs));
     }
-    conn.execute_batch(DB_SCHEMA).await.map_err(to_io)?;
+    // macOS: `synchronous` decides *when* to sync; `fullfsync` decides *how*.
+    // Without it the sync is plain fsync(), which only reaches the drive cache,
+    // not the media. (F_FULLFSYNC. No-op off Apple, so gate it.)
+    if cfg!(target_vendor = "apple") && std::env::var("BREEZY_FULLFSYNC").is_ok() {
+        pragmas.push(("fullfsync", "ON".to_string()));
+    }
+    for (name, value) in &pragmas {
+        conn.pragma_update(*name, value.as_str())
+            .await
+            .map_err(to_io)?;
+    }
+
+    let schema = schema_for_env();
+    conn.execute_batch(&schema).await.map_err(to_io)?;
     conn.busy_timeout(Duration::from_secs(5)).map_err(to_io)?;
 
     let stmts = Statements::new(&conn).await?;
@@ -335,6 +414,12 @@ pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
     checkpoint_conn
         .busy_timeout(Duration::from_secs(5))
         .map_err(to_io)?;
+    if cfg!(target_vendor = "apple") && std::env::var("BREEZY_FULLFSYNC").is_ok() {
+        checkpoint_conn
+            .pragma_update("fullfsync", "ON")
+            .await
+            .map_err(to_io)?;
+    }
 
     let wal_path = {
         let mut os = path.as_os_str().to_owned();
@@ -343,7 +428,10 @@ pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
     };
 
     let rt = RtHandle::current();
-    let (tx, rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
+    let queue_depth = env_usize("BREEZY_WRITE_QUEUE_DEPTH", WRITE_QUEUE_DEPTH);
+    let max_batch_bytes = env_usize("BREEZY_MAX_BATCH_BYTES", MAX_BATCH_BYTES);
+    let wal_truncate_bytes = env_u64("BREEZY_WAL_TRUNCATE_BYTES", WAL_TRUNCATE_BYTES);
+    let (tx, rx) = mpsc::channel(queue_depth);
     let (notify_tx, notify_rx) = mpsc::channel::<()>(1);
 
     let writer_rt = rt.clone();
@@ -351,7 +439,7 @@ pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
         .name("storage-writer".into())
         .spawn(move || {
             let _db = db;
-            writer_loop(conn, stmts, writer_rt, rx, notify_tx)
+            writer_loop(conn, stmts, writer_rt, rx, notify_tx, max_batch_bytes)
         })
         .expect("spawn writer thread");
 
@@ -359,7 +447,7 @@ pub async fn spawn(path: impl AsRef<Path>) -> io::Result<(Writer, Handle)> {
         .name("storage-checkpoint".into())
         .spawn(move || {
             let _db = checkpoint_db;
-            checkpoint_loop(checkpoint_conn, rt, wal_path, notify_rx)
+            checkpoint_loop(checkpoint_conn, rt, wal_path, notify_rx, wal_truncate_bytes)
         })
         .expect("spawn checkpoint thread");
 
@@ -378,6 +466,7 @@ fn writer_loop(
     rt: RtHandle,
     mut rx: mpsc::Receiver<Cmd>,
     notify_tx: mpsc::Sender<()>,
+    max_batch_bytes: usize,
 ) -> Option<Arc<io::Error>> {
     let mut poison: Option<Arc<io::Error>> = None;
 
@@ -385,7 +474,7 @@ fn writer_loop(
         let mut batch = vec![cmd];
         let mut bytes = batch[0].bytes();
 
-        while bytes < MAX_BATCH_BYTES {
+        while bytes < max_batch_bytes {
             match rx.try_recv() {
                 Ok(cmd) => {
                     bytes += cmd.bytes();
@@ -467,6 +556,11 @@ async fn execute_transaction(
     stmts: &mut Statements,
     ops: &[TransactionOp],
 ) -> AckResult {
+    if stmts.no_savepoint {
+        // Isolation experiment only: no per-tx rollback safety.
+        return transaction_body(conn, stmts, ops).await;
+    }
+
     stmts.savepoint.execute(()).await.map_err(arc_err)?;
 
     match transaction_body(conn, stmts, ops).await {
@@ -500,9 +594,15 @@ async fn transaction_body(
 /// The writer pings `rx` after each commit; capacity-1 `try_send` drops the
 /// ping when one is already queued, so bursts collapse into a single checkpoint.
 /// `PASSIVE` normally, `TRUNCATE` once the WAL file passes [`WAL_TRUNCATE_BYTES`].
-fn checkpoint_loop(conn: Connection, rt: RtHandle, wal_path: PathBuf, mut rx: mpsc::Receiver<()>) {
+fn checkpoint_loop(
+    conn: Connection,
+    rt: RtHandle,
+    wal_path: PathBuf,
+    mut rx: mpsc::Receiver<()>,
+    wal_truncate_bytes: u64,
+) {
     while rx.blocking_recv().is_some() {
-        let sql = if wal_bytes(&wal_path) > WAL_TRUNCATE_BYTES {
+        let sql = if wal_bytes(&wal_path) > wal_truncate_bytes {
             CHECKPOINT_TRUNCATE
         } else {
             CHECKPOINT_PASSIVE

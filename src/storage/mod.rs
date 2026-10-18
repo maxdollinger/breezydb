@@ -16,7 +16,8 @@
 pub mod storage;
 
 pub use storage::{
-    DB_SCHEMA, Handle, MAX_BATCH_BYTES, WAL_TRUNCATE_BYTES, WRITE_QUEUE_DEPTH, Writer, spawn,
+    DB_SCHEMA, Handle, MAX_BATCH_BYTES, WAL_TRUNCATE_BYTES, WRITE_QUEUE_DEPTH, Writer, schema_for_env,
+    spawn,
 };
 
 pub(crate) use storage::WriteTx;
