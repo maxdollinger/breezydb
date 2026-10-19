@@ -30,7 +30,7 @@ rm -f "$DB" "$DB-wal" "$DB-shm"
 now() { perl -MTime::HiRes=time -e 'print time'; echo; }
 
 ./target/release/examples/seed_node "$DB" 20 >/dev/null
-BREEZY_SYNCHRONOUS=FULL BREEZY_FULLFSYNC=ON BREEZY_CACHE_SIZE=-2097152 \
+ BREEZY_CACHE_SIZE=-2097152 \
   DB="$DB" PORT=3000 ./target/release/breezydb >"$OUT/server.log" 2>&1 &
 SRV=$!
 for _ in $(seq 1 100); do

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use breezydb::{TransactionOp, Writer, spawn};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -21,11 +22,7 @@ fn ops(v: Value) -> Vec<TransactionOp> {
 
 /// Seed a concept and two attributes the way an operator would out of band.
 async fn seed(path: &Path) {
-    let db = turso::Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = Connection::open(path).unwrap();
     conn.execute_batch(
         "INSERT INTO concept (id, ident) VALUES (1, 'node');
          INSERT INTO concept_ancestor (concept, ancestor) VALUES (1, 1);
@@ -33,7 +30,6 @@ async fn seed(path: &Path) {
            VALUES (2, 'name', 1, 'string', NULL, 1, 0, 0),
                   (3, 'ref',  1, 'ref',     1,    1, 1, 1);",
     )
-    .await
     .unwrap();
 }
 
@@ -120,22 +116,17 @@ async fn group_commit_isolation() {
     assert!(bad.is_err(), "invalid transaction must fail");
 
     // The good transaction's entity survived; nothing from the bad transaction did.
-    let db = turso::Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let conn = db.connect().unwrap();
-    let mut rows = conn
-        .query("SELECT uuid FROM entity ORDER BY id", ())
-        .await
-        .unwrap();
-    let mut uuids = Vec::new();
-    while let Some(row) = rows.next().await.unwrap() {
-        uuids.push(row.get::<String>(0).unwrap());
-    }
+    let conn = Connection::open(&path).unwrap();
+    let mut stmt = conn.prepare("SELECT uuid FROM entity ORDER BY id").unwrap();
+    let uuids: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    drop(stmt);
     assert_eq!(uuids, vec!["good".to_string()]);
 
-    drop((w, db, conn));
+    drop((w, conn));
     h.close().await.unwrap();
     let _ = std::fs::remove_file(&path);
 }

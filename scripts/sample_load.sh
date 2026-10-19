@@ -12,7 +12,7 @@ mkdir -p "$OUT"; rm -rf "$OUT"; mkdir -p "$OUT"
 rm -f "$DB" "$DB-wal" "$DB-shm"
 
 ./target/release/examples/seed_node "$DB" 20 >/dev/null
-BREEZY_SYNCHRONOUS=FULL BREEZY_FULLFSYNC=ON BREEZY_CACHE_SIZE=-2097152 \
+ BREEZY_CACHE_SIZE=-2097152 \
   DB="$DB" PORT=3000 ./target/release/breezydb >"$OUT/server.log" 2>&1 &
 SRV=$!
 for _ in $(seq 1 100); do curl -sf -o /dev/null http://127.0.0.1:3000/noop && break; sleep 0.1; done

@@ -178,7 +178,11 @@ pub fn schema_for_env() -> String {
 fn pragmas() -> Vec<String> {
     let mut pragmas: Vec<String> = vec![
         format!("PRAGMA page_size={};", env_str("BREEZY_PAGE_SIZE", "4096")),
-        format!("PRAGMA synchronous={};", env_str("BREEZY_SYNCHRONOUS", "NORMAL")),
+        // Durability is not negotiable: every commit is fsynced, and on macOS
+        // the fsync forces the drive write cache (F_FULLFSYNC). `OFF` /
+        // `NORMAL` are opt-out experiments (BREEZY_SYNCHRONOUS /
+        // BREEZY_FULLFSYNC), not defaults.
+        format!("PRAGMA synchronous={};", env_str("BREEZY_SYNCHRONOUS", "FULL")),
         "PRAGMA journal_mode=WAL;".to_string(),
         "PRAGMA wal_autocheckpoint=0;".to_string(),
         "PRAGMA foreign_keys=ON;".to_string(),
@@ -188,8 +192,9 @@ fn pragmas() -> Vec<String> {
     }
     // macOS: `synchronous` decides *when* to sync; `fullfsync` decides *how*.
     // Without it the sync is plain fsync(), which only reaches the drive cache,
-    // not the media. (F_FULLFSYNC. No-op off Apple, so gate it.)
-    if cfg!(target_vendor = "apple") && std::env::var("BREEZY_FULLFSYNC").is_ok() {
+    // not the media. (F_FULLFSYNC. No-op off Apple, so gate it.) Default ON:
+    // a 200 must mean power-loss durable, not just crash-durable.
+    if cfg!(target_vendor = "apple") && std::env::var("NO_BREEZY_FULLFSYNC").is_err() {
         pragmas.push("PRAGMA fullfsync=ON;".to_string());
     }
     pragmas
