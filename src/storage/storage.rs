@@ -186,10 +186,12 @@ fn pragmas() -> Vec<String> {
         "PRAGMA journal_mode=WAL;".to_string(),
         "PRAGMA wal_autocheckpoint=0;".to_string(),
         "PRAGMA foreign_keys=ON;".to_string(),
+        // 4 GiB page cache (negative = KiB!) and a 4 GiB memory-mapped I/O
+        // window (bytes). Both env-overridable; the seeders must not set them —
+        // they land on the file only via this connection path.
+        format!("PRAGMA cache_size={};", env_str("BREEZY_CACHE_SIZE", "-4194304")),
+        format!("PRAGMA mmap_size={};", env_str("BREEZY_MMAP_SIZE", "4294967296")),
     ];
-    if let Ok(cs) = std::env::var("BREEZY_CACHE_SIZE") {
-        pragmas.push(format!("PRAGMA cache_size={cs};"));
-    }
     // macOS: `synchronous` decides *when* to sync; `fullfsync` decides *how*.
     // Without it the sync is plain fsync(), which only reaches the drive cache,
     // not the media. (F_FULLFSYNC. No-op off Apple, so gate it.) Default ON:
